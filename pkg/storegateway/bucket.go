@@ -42,6 +42,7 @@ import (
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/storage/sharding"
+	"github.com/grafana/mimir/pkg/storage/tsdb"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
 	"github.com/grafana/mimir/pkg/storage/tsdb/bucketcache"
 	"github.com/grafana/mimir/pkg/storegateway/chunkscache"
@@ -227,18 +228,11 @@ func NewBucketStore(
 	bkt objstore.InstrumentedBucketReader,
 	fetcher block.MetadataFetcher,
 	dir string,
-	maxSeriesPerBatch int,
-	numChunksRangesPerSeries int,
+	bucketStoreConfig tsdb.BucketStoreConfig,
 	postingsStrategy postingsSelectionStrategy,
 	chunksLimiterFactory ChunksLimiterFactory,
 	seriesLimiterFactory SeriesLimiterFactory,
 	partitioners blockPartitioners,
-	blockSyncConcurrency int,
-	postingOffsetsInMemSampling int,
-	indexHeaderCfg indexheader.Config,
-	lazyIndexReaderEnabled bool,
-	lazyIndexReaderIdleTimeout time.Duration,
-	sparsePersistenceEnabled bool,
 	seriesHashCache *hashcache.SeriesHashCache,
 	metrics *BucketStoreMetrics,
 	options ...BucketStoreOption,
@@ -252,19 +246,19 @@ func NewBucketStore(
 		chunksCache:                 chunkscache.NoopCache{},
 		blocks:                      map[ulid.ULID]*bucketBlock{},
 		blockSet:                    newBucketBlockSet(),
-		blockSyncConcurrency:        blockSyncConcurrency,
+		blockSyncConcurrency:        bucketStoreConfig.BlockSyncConcurrency,
 		queryGate:                   gate.NewNoop(),
 		lazyLoadingGate:             gate.NewNoop(),
 		chunksLimiterFactory:        chunksLimiterFactory,
 		seriesLimiterFactory:        seriesLimiterFactory,
 		partitioners:                partitioners,
-		postingOffsetsInMemSampling: postingOffsetsInMemSampling,
-		indexHeaderCfg:              indexHeaderCfg,
+		postingOffsetsInMemSampling: bucketStoreConfig.PostingOffsetsInMemSampling,
+		indexHeaderCfg:              bucketStoreConfig.IndexHeader,
 		seriesHashCache:             seriesHashCache,
 		metrics:                     metrics,
 		userID:                      userID,
-		maxSeriesPerBatch:           maxSeriesPerBatch,
-		numChunksRangesPerSeries:    numChunksRangesPerSeries,
+		maxSeriesPerBatch:           bucketStoreConfig.StreamingBatchSize,
+		numChunksRangesPerSeries:    bucketStoreConfig.ChunkRangesPerSeries,
 		postingsStrategy:            postingsStrategy,
 	}
 
@@ -272,8 +266,13 @@ func NewBucketStore(
 		option(s)
 	}
 
+	lazyLoadedSnapshotConfig := indexheader.LazyLoadedHeadersSnapshotConfig{
+		Path:                dir,
+		UserID:              userID,
+		EagerLoadingEnabled: bucketStoreConfig.IndexHeader.IndexHeaderEagerLoadingStartupEnabled,
+	}
 	// Depend on the options
-	s.indexReaderPool = indexheader.NewReaderPool(s.logger, lazyIndexReaderEnabled, lazyIndexReaderIdleTimeout, sparsePersistenceEnabled, s.lazyLoadingGate, metrics.indexHeaderReaderMetrics)
+	s.indexReaderPool = indexheader.NewReaderPool(s.logger, bucketStoreConfig.IndexHeaderLazyLoadingEnabled, bucketStoreConfig.IndexHeaderLazyLoadingIdleTimeout, bucketStoreConfig.IndexHeaderSparsePersistenceEnabled, s.lazyLoadingGate, metrics.indexHeaderReaderMetrics, lazyLoadedSnapshotConfig)
 
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create dir")
@@ -306,6 +305,10 @@ func (s *BucketStore) Stats() BucketStoreStats {
 // SyncBlocks synchronizes the stores state with the Bucket bucket.
 // It will reuse disk space as persistent cache based on s.dir param.
 func (s *BucketStore) SyncBlocks(ctx context.Context) error {
+	return s.syncBlocks(ctx, false)
+}
+
+func (s *BucketStore) syncBlocks(ctx context.Context, initialSync bool) error {
 	metas, _, metaFetchErr := s.fetcher.Fetch(ctx)
 	// For partial view allow adding new blocks at least.
 	if metaFetchErr != nil && metas == nil {
@@ -319,7 +322,7 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			for meta := range blockc {
-				if err := s.addBlock(ctx, meta); err != nil {
+				if err := s.addBlock(ctx, meta, initialSync); err != nil {
 					continue
 				}
 			}
@@ -361,7 +364,7 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 // InitialSync perform blocking sync with extra step at the end to delete locally saved blocks that are no longer
 // present in the bucket. The mismatch of these can only happen between restarts, so we can do that only once per startup.
 func (s *BucketStore) InitialSync(ctx context.Context) error {
-	if err := s.SyncBlocks(ctx); err != nil {
+	if err := s.syncBlocks(ctx, true); err != nil {
 		return errors.Wrap(err, "sync block")
 	}
 
@@ -397,7 +400,7 @@ func (s *BucketStore) getBlock(id ulid.ULID) *bucketBlock {
 	return s.blocks[id]
 }
 
-func (s *BucketStore) addBlock(ctx context.Context, meta *block.Meta) (err error) {
+func (s *BucketStore) addBlock(ctx context.Context, meta *block.Meta, initialSync bool) (err error) {
 	dir := filepath.Join(s.dir, meta.ULID.String())
 	start := time.Now()
 
@@ -423,6 +426,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *block.Meta) (err error
 		meta.ULID,
 		s.postingOffsetsInMemSampling,
 		s.indexHeaderCfg,
+		initialSync,
 	)
 	if err != nil {
 		return errors.Wrap(err, "create index header reader")
@@ -632,6 +636,8 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 	if err := s.sendHints(srv, resHints); err != nil {
 		return err
 	}
+
+	streamingSeriesCount := 0
 	if req.StreamingChunksBatchSize > 0 {
 		var (
 			seriesSet       storepb.SeriesSet
@@ -645,17 +651,17 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 			return err
 		}
 
-		numSeries, err := s.sendStreamingSeriesLabelsAndStats(req, srv, stats, seriesSet)
+		streamingSeriesCount, err = s.sendStreamingSeriesLabelsAndStats(req, srv, stats, seriesSet)
 		if err != nil {
 			return err
 		}
 		level.Debug(spanLogger).Log(
 			"msg", "sent streaming series",
-			"num_series", numSeries,
+			"num_series", streamingSeriesCount,
 			"duration", time.Since(seriesLoadStart),
 		)
 
-		if numSeries == 0 {
+		if streamingSeriesCount == 0 {
 			// There is no series to send chunks for.
 			return nil
 		}
@@ -673,7 +679,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		if err != nil {
 			return err
 		}
-		err = s.sendStreamingChunks(req, srv, seriesChunkIt, stats)
+		err = s.sendStreamingChunks(req, srv, seriesChunkIt, stats, streamingSeriesCount)
 	} else {
 		var seriesSet storepb.SeriesSet
 		seriesSet, err = s.nonStreamingSeriesSetForBlocks(ctx, req, blocks, indexReaders, readers, shardSelector, matchers, chunksLimiter, seriesLimiter, stats)
@@ -779,6 +785,7 @@ func (s *BucketStore) sendStreamingChunks(
 	srv storepb.Store_SeriesServer,
 	it seriesChunksSetIterator,
 	stats *safeQueryStats,
+	totalSeriesCount int,
 ) error {
 	var (
 		encodeDuration           time.Duration
@@ -808,9 +815,34 @@ func (s *BucketStore) sendStreamingChunks(
 	for i := range chunksBuffer {
 		chunksBuffer[i] = &storepb.StreamingChunks{}
 	}
+	haveSentEstimatedChunks := false
 	chunksBatch := &storepb.StreamingChunksBatch{Series: chunksBuffer[:0]}
 	for it.Next() {
 		set := it.At()
+
+		if len(set.series) == 0 {
+			set.release()
+			continue
+		}
+
+		// We send the estimate before any chunks.
+		if !haveSentEstimatedChunks {
+			seriesInBatch := len(set.series)
+			chunksInBatch := 0
+
+			for _, sc := range set.series {
+				chunksInBatch += len(sc.chks)
+			}
+
+			estimate := uint64(totalSeriesCount * chunksInBatch / seriesInBatch)
+			err := s.sendMessage("streaming chunks estimate", srv, storepb.NewStreamingChunksEstimate(estimate), &encodeDuration, &sendDuration)
+			if err != nil {
+				return err
+			}
+
+			haveSentEstimatedChunks = true
+		}
+
 		for _, sc := range set.series {
 			seriesCount++
 			chunksBatch.Series = chunksBatch.Series[:len(chunksBatch.Series)+1]
@@ -850,6 +882,14 @@ func (s *BucketStore) sendStreamingChunks(
 
 	if it.Err() != nil {
 		return it.Err()
+	}
+
+	// If we never sent an estimate (because there were no batches, or no batch had any series), send it now.
+	if !haveSentEstimatedChunks {
+		err := s.sendMessage("streaming chunks estimate", srv, storepb.NewStreamingChunksEstimate(0), &encodeDuration, &sendDuration)
+		if err != nil {
+			return err
+		}
 	}
 
 	return it.Err()

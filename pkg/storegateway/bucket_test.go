@@ -1480,18 +1480,22 @@ func benchBucketSeries(t test.TB, skipChunk bool, samplesPerSeries, totalSeries 
 			ibkt,
 			f,
 			tmpDir,
-			testData.maxSeriesPerBatch,
-			1,
+			mimir_tsdb.BucketStoreConfig{
+				StreamingBatchSize:          testData.maxSeriesPerBatch,
+				ChunkRangesPerSeries:        1,
+				BlockSyncConcurrency:        1,
+				PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+				IndexHeader: indexheader.Config{
+					IndexHeaderEagerLoadingStartupEnabled: false,
+				},
+				IndexHeaderLazyLoadingEnabled:       false,
+				IndexHeaderLazyLoadingIdleTimeout:   0,
+				IndexHeaderSparsePersistenceEnabled: true,
+			},
 			selectAllStrategy{},
 			newStaticChunksLimiterFactory(0),
 			newStaticSeriesLimiterFactory(0),
 			newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-			1,
-			mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-			indexheader.Config{},
-			false,
-			0,
-			true,
 			hashcache.NewSeriesHashCache(1024*1024),
 			NewBucketStoreMetrics(reg),
 			testData.options...,
@@ -1577,7 +1581,7 @@ func TestBucketStore_Series_Concurrency(t *testing.T) {
 			StreamingChunksBatchSize: uint64(streamBatchSize),
 		}
 		srv := newBucketStoreTestServer(t, store)
-		seriesSet, warnings, _, err := srv.Series(context.Background(), req)
+		seriesSet, warnings, _, _, err := srv.Series(context.Background(), req)
 		require.NoError(t, err)
 		require.Equal(t, 0, len(warnings), "%v", warnings)
 		require.Equal(t, len(expectedSeries), len(seriesSet))
@@ -1599,24 +1603,29 @@ func TestBucketStore_Series_Concurrency(t *testing.T) {
 
 					metaFetcher, err := block.NewMetaFetcher(logger, 1, instrumentedBucket, "", nil, nil)
 					assert.NoError(t, err)
+
 					// Create the bucket store.
 					store, err := NewBucketStore(
 						"test-user",
 						instrumentedBucket,
 						metaFetcher,
 						tmpDir,
-						batchSize,
-						1,
+						mimir_tsdb.BucketStoreConfig{
+							StreamingBatchSize:          batchSize,
+							ChunkRangesPerSeries:        1,
+							BlockSyncConcurrency:        1,
+							PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+							IndexHeader: indexheader.Config{
+								IndexHeaderEagerLoadingStartupEnabled: false,
+							},
+							IndexHeaderLazyLoadingEnabled:       false,
+							IndexHeaderLazyLoadingIdleTimeout:   0,
+							IndexHeaderSparsePersistenceEnabled: true,
+						},
 						selectAllStrategy{},
 						newStaticChunksLimiterFactory(0),
 						newStaticSeriesLimiterFactory(0),
 						newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-						1,
-						mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-						indexheader.Config{},
-						false, // Lazy index-header loading disabled.
-						0,
-						true, // Sparse index-header persistence enabled.
 						hashcache.NewSeriesHashCache(1024*1024),
 						NewBucketStoreMetrics(nil),
 						WithLogger(logger),
@@ -1764,7 +1773,7 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 		logger:          logger,
 		indexCache:      indexCache,
 		chunksCache:     chunkscache.NoopCache{},
-		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), false, 0, true, gate.NewNoop(), indexheader.NewReaderPoolMetrics(nil)),
+		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), false, 0, true, gate.NewNoop(), indexheader.NewReaderPoolMetrics(nil), indexheader.LazyLoadedHeadersSnapshotConfig{}),
 		metrics:         NewBucketStoreMetrics(nil),
 		blockSet:        &bucketBlockSet{blocks: []*bucketBlock{b1, b2}},
 		blocks: map[ulid.ULID]*bucketBlock{
@@ -1782,7 +1791,7 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	srv := newBucketStoreTestServer(t, store)
 
 	t.Run("invoke series for one block. Fill the cache on the way.", func(t *testing.T) {
-		seriesSet, warnings, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
+		seriesSet, warnings, _, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
 			MinTime: 0,
 			MaxTime: int64(numSeries) - 1,
 			Matchers: []storepb.LabelMatcher{
@@ -1798,7 +1807,7 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 		assert.Equal(t, numSeries, len(seriesSet))
 	})
 	t.Run("invoke series for second block. This should revoke previous cache.", func(t *testing.T) {
-		seriesSet, warnings, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
+		seriesSet, warnings, _, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
 			MinTime: 0,
 			MaxTime: int64(numSeries) - 1,
 			Matchers: []storepb.LabelMatcher{
@@ -1816,7 +1825,7 @@ func TestBucketStore_Series_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	t.Run("remove second block. Cache stays. Ask for first again.", func(t *testing.T) {
 		assert.NoError(t, store.removeBlock(b2.meta.ULID))
 
-		seriesSet, warnings, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
+		seriesSet, warnings, _, _, err := srv.Series(context.Background(), &storepb.SeriesRequest{
 			MinTime: 0,
 			MaxTime: int64(numSeries) - 1,
 			Matchers: []storepb.LabelMatcher{
@@ -1925,18 +1934,22 @@ func TestBucketStore_Series_ErrorUnmarshallingRequestHints(t *testing.T) {
 		instrBkt,
 		fetcher,
 		tmpDir,
-		5000,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          5000,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        10,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: false,
+			},
+			IndexHeaderLazyLoadingEnabled:       false,
+			IndexHeaderLazyLoadingIdleTimeout:   0,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		selectAllStrategy{},
 		newStaticChunksLimiterFactory(10000/MaxSamplesPerChunk),
 		newStaticSeriesLimiterFactory(0),
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		10,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		false,
-		0,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(nil),
 		WithLogger(logger),
@@ -1959,7 +1972,7 @@ func TestBucketStore_Series_ErrorUnmarshallingRequestHints(t *testing.T) {
 	}
 
 	srv := newBucketStoreTestServer(t, store)
-	_, _, _, err = srv.Series(context.Background(), req)
+	_, _, _, _, err = srv.Series(context.Background(), req)
 	assert.Error(t, err)
 	assert.Equal(t, true, regexp.MustCompile(".*unmarshal series request hints.*").MatchString(err.Error()))
 }
@@ -1981,18 +1994,22 @@ func TestBucketStore_Series_CanceledRequest(t *testing.T) {
 		instrBkt,
 		fetcher,
 		tmpDir,
-		5000,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          5000,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        10,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: false,
+			},
+			IndexHeaderLazyLoadingEnabled:       false,
+			IndexHeaderLazyLoadingIdleTimeout:   0,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		selectAllStrategy{},
 		newStaticChunksLimiterFactory(10000/MaxSamplesPerChunk),
 		newStaticSeriesLimiterFactory(0),
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		10,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		false,
-		0,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(nil),
 		WithLogger(logger),
@@ -2013,14 +2030,14 @@ func TestBucketStore_Series_CanceledRequest(t *testing.T) {
 	cancel()
 
 	srv := newBucketStoreTestServer(t, store)
-	_, _, _, err = srv.Series(ctx, req)
+	_, _, _, _, err = srv.Series(ctx, req)
 	assert.Error(t, err)
 	s, ok := status.FromError(err)
 	assert.True(t, ok)
 	assert.Equal(t, codes.Canceled, s.Code())
 
 	req.StreamingChunksBatchSize = 10
-	_, _, _, err = srv.Series(ctx, req)
+	_, _, _, _, err = srv.Series(ctx, req)
 	assert.Error(t, err)
 	s, ok = status.FromError(err)
 	assert.True(t, ok)
@@ -2044,18 +2061,22 @@ func TestBucketStore_Series_InvalidRequest(t *testing.T) {
 		instrBkt,
 		fetcher,
 		tmpDir,
-		5000,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          5000,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        10,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: false,
+			},
+			IndexHeaderLazyLoadingEnabled:       false,
+			IndexHeaderLazyLoadingIdleTimeout:   0,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		selectAllStrategy{},
 		newStaticChunksLimiterFactory(10000/MaxSamplesPerChunk),
 		newStaticSeriesLimiterFactory(0),
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		10,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		false,
-		0,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(nil),
 		WithLogger(logger),
@@ -2073,7 +2094,7 @@ func TestBucketStore_Series_InvalidRequest(t *testing.T) {
 	}
 
 	srv := newBucketStoreTestServer(t, store)
-	_, _, _, err = srv.Series(context.Background(), req)
+	_, _, _, _, err = srv.Series(context.Background(), req)
 	assert.Error(t, err)
 	s, ok := status.FromError(err)
 	assert.True(t, ok)
@@ -2113,7 +2134,7 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 	encoding chunkenc.Encoding) {
 	tmpDir := t.TempDir()
 
-	// Create a block with 1 series but an high number of samples,
+	// Create a block with 1 series but a high number of samples,
 	// so that they will span across multiple chunks.
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.EnableNativeHistograms.Store(true)
@@ -2166,18 +2187,22 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 		instrBkt,
 		fetcher,
 		tmpDir,
-		5000,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          5000,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        10,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: false,
+			},
+			IndexHeaderLazyLoadingEnabled:       false,
+			IndexHeaderLazyLoadingIdleTimeout:   0,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		selectAllStrategy{},
 		newStaticChunksLimiterFactory(100000/MaxSamplesPerChunk),
 		newStaticSeriesLimiterFactory(0),
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		10,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		false,
-		0,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(nil),
 		WithLogger(logger),
@@ -2190,29 +2215,34 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 	srv := newBucketStoreTestServer(t, store)
 
 	tests := map[string]struct {
-		reqMinTime      int64
-		reqMaxTime      int64
-		expectedSamples int
+		reqMinTime             int64
+		reqMaxTime             int64
+		expectedSamples        int
+		expectedChunksEstimate uint64
 	}{
 		"query the entire block": {
-			reqMinTime:      math.MinInt64,
-			reqMaxTime:      math.MaxInt64,
-			expectedSamples: 10000,
+			reqMinTime:             math.MinInt64,
+			reqMaxTime:             math.MaxInt64,
+			expectedSamples:        10000,
+			expectedChunksEstimate: uint64(math.Ceil(10000.0 / MaxSamplesPerChunk)),
 		},
 		"query the beginning of the block": {
-			reqMinTime:      0,
-			reqMaxTime:      100,
-			expectedSamples: MaxSamplesPerChunk,
+			reqMinTime:             0,
+			reqMaxTime:             100,
+			expectedSamples:        MaxSamplesPerChunk,
+			expectedChunksEstimate: 1,
 		},
 		"query the middle of the block": {
-			reqMinTime:      4000,
-			reqMaxTime:      4050,
-			expectedSamples: MaxSamplesPerChunk,
+			reqMinTime:             4000,
+			reqMaxTime:             4050,
+			expectedSamples:        MaxSamplesPerChunk,
+			expectedChunksEstimate: 1,
 		},
 		"query the end of the block": {
-			reqMinTime:      9800,
-			reqMaxTime:      10000,
-			expectedSamples: (MaxSamplesPerChunk * 2) + (10000 % MaxSamplesPerChunk),
+			reqMinTime:             9800,
+			reqMaxTime:             10000,
+			expectedSamples:        (MaxSamplesPerChunk * 2) + (10000 % MaxSamplesPerChunk),
+			expectedChunksEstimate: 3,
 		},
 	}
 
@@ -2229,7 +2259,7 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 						StreamingChunksBatchSize: uint64(streamingBatchSize),
 					}
 
-					seriesSet, _, _, err := srv.Series(context.Background(), req)
+					seriesSet, _, _, estimatedChunks, err := srv.Series(context.Background(), req)
 					assert.NoError(t, err)
 					assert.True(t, len(seriesSet) == 1)
 
@@ -2240,6 +2270,12 @@ func testBucketStoreSeriesBlockWithMultipleChunks(
 						assert.NoError(t, err)
 
 						numSamples += decodedChunk.NumSamples()
+					}
+
+					if streamingBatchSize == 0 {
+						require.Zero(t, estimatedChunks)
+					} else {
+						require.Equal(t, testData.expectedChunksEstimate, estimatedChunks)
 					}
 
 					assert.True(t, testData.expectedSamples == numSamples, "expected: %d, actual: %d", testData.expectedSamples, numSamples)
@@ -2329,18 +2365,22 @@ func TestBucketStore_Series_Limits(t *testing.T) {
 						instrBkt,
 						fetcher,
 						tmpDir,
-						batchSize,
-						1,
+						mimir_tsdb.BucketStoreConfig{
+							StreamingBatchSize:          batchSize,
+							ChunkRangesPerSeries:        1,
+							BlockSyncConcurrency:        10,
+							PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+							IndexHeader: indexheader.Config{
+								IndexHeaderEagerLoadingStartupEnabled: false,
+							},
+							IndexHeaderLazyLoadingEnabled:       false,
+							IndexHeaderLazyLoadingIdleTimeout:   0,
+							IndexHeaderSparsePersistenceEnabled: true,
+						},
 						selectAllStrategy{},
 						newStaticChunksLimiterFactory(testData.chunksLimit),
 						newStaticSeriesLimiterFactory(testData.seriesLimit),
 						newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-						10,
-						mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-						indexheader.Config{},
-						false,
-						0,
-						true,
 						hashcache.NewSeriesHashCache(1024*1024),
 						NewBucketStoreMetrics(nil),
 					)
@@ -2357,7 +2397,7 @@ func TestBucketStore_Series_Limits(t *testing.T) {
 								StreamingChunksBatchSize: uint64(streamingBatchSize),
 							}
 
-							seriesSet, _, _, err := srv.Series(ctx, req)
+							seriesSet, _, _, _, err := srv.Series(ctx, req)
 
 							if testData.expectedErr != "" {
 								require.Error(t, err)
@@ -2445,18 +2485,22 @@ func setupStoreForHintsTest(t *testing.T, maxSeriesPerBatch int, opts ...BucketS
 		instrBkt,
 		fetcher,
 		tmpDir,
-		maxSeriesPerBatch,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          maxSeriesPerBatch,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        10,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: false,
+			},
+			IndexHeaderLazyLoadingEnabled:       false,
+			IndexHeaderLazyLoadingIdleTimeout:   0,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		selectAllStrategy{},
 		newStaticChunksLimiterFactory(10000/MaxSamplesPerChunk),
 		newStaticSeriesLimiterFactory(0),
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		10,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		false,
-		0,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(nil),
 		opts...,
@@ -2845,7 +2889,7 @@ func runTestServerSeries(t test.TB, store *BucketStore, streamingBatchSize int, 
 			c.Req.StreamingChunksBatchSize = uint64(streamingBatchSize)
 			t.ResetTimer()
 			for i := 0; i < t.N(); i++ {
-				seriesSet, warnings, hints, err := srv.Series(context.Background(), c.Req)
+				seriesSet, warnings, hints, _, err := srv.Series(context.Background(), c.Req)
 				require.NoError(t, err)
 				require.Equal(t, len(c.ExpectedWarnings), len(warnings), "%v", warnings)
 				require.Equal(t, len(c.ExpectedSeries), len(seriesSet), "Matchers: %v Min time: %d Max time: %d", c.Req.Matchers, c.Req.MinTime, c.Req.MaxTime)

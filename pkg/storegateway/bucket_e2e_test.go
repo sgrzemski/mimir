@@ -36,7 +36,6 @@ import (
 	"github.com/grafana/mimir/pkg/storegateway/indexcache"
 	"github.com/grafana/mimir/pkg/storegateway/indexheader"
 	"github.com/grafana/mimir/pkg/storegateway/storepb"
-	"github.com/grafana/mimir/pkg/util"
 )
 
 var (
@@ -197,18 +196,22 @@ func prepareStoreWithTestBlocks(t testing.TB, bkt objstore.Bucket, cfg *prepareS
 		objstore.WithNoopInstr(bkt),
 		metaFetcher,
 		cfg.tempDir,
-		cfg.maxSeriesPerBatch,
-		1,
+		mimir_tsdb.BucketStoreConfig{
+			StreamingBatchSize:          cfg.maxSeriesPerBatch,
+			ChunkRangesPerSeries:        1,
+			BlockSyncConcurrency:        20,
+			PostingOffsetsInMemSampling: mimir_tsdb.DefaultPostingOffsetInMemorySampling,
+			IndexHeader: indexheader.Config{
+				IndexHeaderEagerLoadingStartupEnabled: true,
+			},
+			IndexHeaderLazyLoadingEnabled:       true,
+			IndexHeaderLazyLoadingIdleTimeout:   time.Minute,
+			IndexHeaderSparsePersistenceEnabled: true,
+		},
 		cfg.postingsStrategy,
 		cfg.chunksLimiterFactory,
 		cfg.seriesLimiterFactory,
 		newGapBasedPartitioners(mimir_tsdb.DefaultPartitionerMaxGapSize, nil),
-		20,
-		mimir_tsdb.DefaultPostingOffsetInMemorySampling,
-		indexheader.Config{},
-		true,
-		time.Minute,
-		true,
 		hashcache.NewSeriesHashCache(1024*1024),
 		NewBucketStoreMetrics(s.metricsRegistry),
 		storeOpts...,
@@ -436,7 +439,7 @@ func testBucketStore_e2e(t *testing.T, ctx context.Context, s *storeSuite, addit
 		for _, streamingBatchSize := range []int{0, 1, 5, 256} {
 			if ok := t.Run(fmt.Sprintf("%d,streamingBatchSize=%d", i, streamingBatchSize), func(t *testing.T) {
 				tcase.req.StreamingChunksBatchSize = uint64(streamingBatchSize)
-				seriesSet, _, _, err := srv.Series(context.Background(), tcase.req)
+				seriesSet, _, _, _, err := srv.Series(context.Background(), tcase.req)
 				require.NoError(t, err)
 
 				assert.Equal(t, len(tcase.expected), len(seriesSet))
@@ -473,17 +476,6 @@ func assertQueryStatsMetricsRecorded(t *testing.T, numSeries int, numChunksPerSe
 		assert.NotZero(t, numObservationsForSummaries(t, "cortex_bucket_store_series_data_touched", metrics, "data_type", "chunks"))
 		assert.NotZero(t, numObservationsForSummaries(t, "cortex_bucket_store_series_data_fetched", metrics, "data_type", "chunks"))
 	}
-}
-
-func getMetricsMatchingLabels(mf *dto.MetricFamily, selectors []labels.Label) []*dto.Metric {
-	var result []*dto.Metric
-	for _, m := range mf.GetMetric() {
-		if !util.MatchesSelectors(m, selectors) {
-			continue
-		}
-		result = append(result, m)
-	}
-	return result
 }
 
 func TestBucketStore_e2e(t *testing.T) {
@@ -706,7 +698,7 @@ func TestBucketStore_Series_ChunksLimiter_e2e(t *testing.T) {
 					}
 
 					srv := newBucketStoreTestServer(t, s.store)
-					_, _, _, err := srv.Series(context.Background(), req)
+					_, _, _, _, err := srv.Series(context.Background(), req)
 
 					if testData.expectedErr == "" {
 						assert.NoError(t, err)
@@ -962,7 +954,7 @@ func TestBucketStore_ValueTypes_e2e(t *testing.T) {
 				}
 
 				srv := newBucketStoreTestServer(t, s.store)
-				seriesSet, _, _, err := srv.Series(ctx, req)
+				seriesSet, _, _, _, err := srv.Series(ctx, req)
 				require.NoError(t, err)
 
 				counts := map[storepb.Chunk_Encoding]int{}
@@ -1016,23 +1008,11 @@ func foreachStore(t *testing.T, runTest func(t *testing.T, newSuite suiteFactory
 	})
 }
 
-func toLabels(t *testing.T, labelValuePairs []string) (result []labels.Label) {
-	t.Helper()
-
-	if len(labelValuePairs)%2 != 0 {
-		t.Fatalf("invalid label name-value pairs %s", strings.Join(labelValuePairs, ""))
-	}
-	for i := 0; i < len(labelValuePairs); i += 2 {
-		result = append(result, labels.Label{Name: labelValuePairs[i], Value: labelValuePairs[i+1]})
-	}
-	return
-}
-
 func numObservationsForSummaries(t *testing.T, summaryName string, metrics dskit_metrics.MetricFamilyMap, labelValuePairs ...string) uint64 {
 	t.Helper()
 
 	summaryData := &dskit_metrics.SummaryData{}
-	for _, metric := range getMetricsMatchingLabels(metrics[summaryName], toLabels(t, labelValuePairs)) {
+	for _, metric := range dskit_metrics.FindMetricsInFamilyMatchingLabels(metrics[summaryName], labelValuePairs...) {
 		summaryData.AddSummary(metric.GetSummary())
 	}
 	m := &dto.Metric{}
@@ -1044,7 +1024,7 @@ func numObservationsForHistogram(t *testing.T, histogramName string, metrics dsk
 	t.Helper()
 
 	histogramData := &dskit_metrics.HistogramData{}
-	for _, metric := range getMetricsMatchingLabels(metrics[histogramName], toLabels(t, labelValuePairs)) {
+	for _, metric := range dskit_metrics.FindMetricsInFamilyMatchingLabels(metrics[histogramName], labelValuePairs...) {
 		histogramData.AddHistogram(metric.GetHistogram())
 	}
 	m := &dto.Metric{}

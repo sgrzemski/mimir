@@ -366,6 +366,10 @@ overrides_exporter:
 # The common block holds configurations that configure multiple components at a
 # time.
 [common: <common>]
+
+# (experimental) Enables optimized marshaling of timeseries.
+# CLI flag: -timeseries-unmarshal-caching-optimization-enabled
+[timeseries_unmarshal_caching_optimization_enabled: <boolean> | default = true]
 ```
 
 ### common
@@ -453,6 +457,16 @@ The `server` block configures the HTTP and gRPC server of the launched service(s
 [tls_min_version: <string> | default = ""]
 
 http_tls_config:
+  # Server TLS certificate. This configuration parameter is YAML only.
+  [cert: <string> | default = ""]
+
+  # Server TLS key. This configuration parameter is YAML only.
+  [key: <string> | default = ""]
+
+  # Root certificate authority used to verify client certificates. This
+  # configuration parameter is YAML only.
+  [client_ca: <string> | default = ""]
+
   # (advanced) HTTP server cert path.
   # CLI flag: -server.http-tls-cert-path
   [cert_file: <string> | default = ""]
@@ -470,6 +484,16 @@ http_tls_config:
   [client_ca_file: <string> | default = ""]
 
 grpc_tls_config:
+  # Server TLS certificate. This configuration parameter is YAML only.
+  [cert: <string> | default = ""]
+
+  # Server TLS key. This configuration parameter is YAML only.
+  [key: <string> | default = ""]
+
+  # Root certificate authority used to verify client certificates. This
+  # configuration parameter is YAML only.
+  [client_ca: <string> | default = ""]
+
   # (advanced) GRPC TLS server cert path.
   # CLI flag: -server.grpc-tls-cert-path
   [cert_file: <string> | default = ""]
@@ -777,6 +801,10 @@ instance_limits:
   # per-tenant. Additional requests will be rejected. 0 = unlimited.
   # CLI flag: -distributor.instance-limits.max-inflight-push-requests-bytes
   [max_inflight_push_requests_bytes: <int> | default = 0]
+
+# (experimental) Enable pooling of buffers used for marshaling write requests.
+# CLI flag: -distributor.write-requests-buffer-pooling-enabled
+[write_requests_buffer_pooling_enabled: <boolean> | default = false]
 ```
 
 ### ingester
@@ -2708,10 +2736,11 @@ The `limits` block configures default and per-tenant limits imposed by component
 # CLI flag: -validation.max-native-histogram-buckets
 [max_native_histogram_buckets: <int> | default = 0]
 
-# (advanced) Controls how far into the future incoming samples are accepted
-# compared to the wall clock. Any sample with timestamp `t` will be rejected if
-# `t > (now + validation.create-grace-period)`. Also used by query-frontend to
-# avoid querying too far into the future. 0 to disable.
+# (advanced) Controls how far into the future incoming samples and exemplars are
+# accepted compared to the wall clock. Any sample or exemplar will be rejected
+# if its timestamp is greater than '(now + grace_period)'. This configuration is
+# enforced in the distributor, ingester and query-frontend (to avoid querying
+# too far into the future).
 # CLI flag: -validation.create-grace-period
 [creation_grace_period: <duration> | default = 10m]
 
@@ -2732,6 +2761,12 @@ The `limits` block configures default and per-tenant limits imposed by component
 # Prometheus server, e.g. remote_write.write_relabel_configs. Labels available
 # during the relabeling phase and cleaned afterwards: __meta_tenant_id
 [metric_relabel_configs: <relabel_config...> | default = ]
+
+# (experimental) If enabled, rate limit errors will be reported to the client
+# with HTTP status code 529 (Service is overloaded). If disabled, status code
+# 429 (Too Many Requests) is used.
+# CLI flag: -distributor.service-overload-status-code-on-rate-limit-enabled
+[service_overload_status_code_on_rate_limit_enabled: <boolean> | default = false]
 
 # The maximum number of in-memory series per tenant, across the cluster before
 # replication. 0 to disable.
@@ -2809,6 +2844,13 @@ The `limits` block configures default and per-tenant limits imposed by component
 # store-gateway. 0 to disable.
 # CLI flag: -querier.max-fetched-chunks-per-query
 [max_fetched_chunks_per_query: <int> | default = 2000000]
+
+# (experimental) Maximum number of chunks estimated to be fetched in a single
+# query from ingesters and long-term storage, as a multiple of
+# -querier.max-fetched-chunks-per-query. This limit is enforced in the querier.
+# Must be greater than or equal to 1, or 0 to disable.
+# CLI flag: -querier.max-estimated-fetched-chunks-per-query-multiplier
+[max_estimated_fetched_chunks_per_query_multiplier: <float> | default = 0]
 
 # The maximum number of unique series for which a query can fetch samples from
 # each ingesters and storage. This limit is enforced in the querier, ruler and
@@ -3412,9 +3454,15 @@ bucket_store:
 
   index_header:
     # (advanced) Maximum number of idle file handles the store-gateway keeps
-    # open for each index header file.
+    # open for each index-header file.
     # CLI flag: -blocks-storage.bucket-store.index-header.max-idle-file-handles
     [max_idle_file_handles: <int> | default = 1]
+
+    # (experimental) If enabled, store-gateway will periodically persist block
+    # IDs of lazy loaded index-headers and load them eagerly during startup. It
+    # is not valid to enable this if index-header lazy loading is disabled.
+    # CLI flag: -blocks-storage.bucket-store.index-header.eager-loading-startup-enabled
+    [eager_loading_startup_enabled: <boolean> | default = false]
 
     # (advanced) If true, verify the checksum of index headers upon loading them
     # (either on startup or lazily when lazy loading is enabled). Setting to
@@ -4127,6 +4175,10 @@ The `redis` block configures the Redis-based caching backend. The supported CLI 
 # (advanced) Maximum number of connections in the pool.
 # CLI flag: -<prefix>.redis.connection-pool-size
 [connection_pool_size: <int> | default = 100]
+
+# (advanced) Maximum duration to wait to get a connection from pool.
+# CLI flag: -<prefix>.redis.connection-pool-timeout
+[connection_pool_timeout: <duration> | default = 4s]
 
 # (advanced) Minimum number of idle connections.
 # CLI flag: -<prefix>.redis.min-idle-connections

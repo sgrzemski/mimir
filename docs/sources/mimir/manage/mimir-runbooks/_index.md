@@ -1253,7 +1253,15 @@ This non-critical error occurs when Mimir receives a write request that contains
 Mimir accepts timestamps that are slightly in the future, due to skewed clocks for example. It rejects timestamps that are too far in the future, based on the definition that you can set via the `-validation.create-grace-period` option.
 On a per-tenant basis, you can fine tune the tolerance by configuring the `-validation.max-length-label-value` option.
 
-> **Note:** Series with invalid samples are skipped during the ingestion, and series within the same request are ingested.
+> **Note:** Only series with invalid samples are skipped during the ingestion. Valid samples within the same request are still ingested.
+
+### err-mimir-exemplar-too-far-in-future
+
+This non-critical error occurs when Mimir receives a write request that contains an exemplar whose timestamp is in the future compared to the current "real world" time.
+Mimir accepts timestamps that are slightly in the future, due to skewed clocks for example. It rejects timestamps that are too far in the future, based on the definition that you can set via the `-validation.create-grace-period` option.
+On a per-tenant basis, you can fine tune the tolerance by configuring the `-validation.max-length-label-value` option.
+
+> **Note:** Only series with invalid samples are skipped during the ingestion. Valid samples within the same request are still ingested.
 
 ### err-mimir-exemplar-labels-missing
 
@@ -1461,7 +1469,7 @@ How to **fix** it:
 
 ### err-mimir-max-chunks-per-query
 
-This error occurs when a query execution exceeds the limit on the number of series chunks fetched.
+This error occurs when execution of a query exceeds the limit on the number of series chunks fetched.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-chunks-per-query` option (or `max_fetched_chunks_per_query` in the runtime configuration).
@@ -1471,9 +1479,23 @@ How to **fix** it:
 - Consider reducing the time range and/or cardinality of the query. To reduce the cardinality of the query, you can add more label matchers to the query, restricting the set of matching series.
 - Consider increasing the per-tenant limit by using the `-querier.max-fetched-chunks-per-query` option (or `max_fetched_chunks_per_query` in the runtime configuration).
 
+### err-mimir-max-estimated-chunks-per-query
+
+This error occurs when execution of a query exceeds the limit on the estimated number of series chunks expected to be fetched.
+
+The estimate is based on the actual number of chunks that will be sent from ingesters to queriers, and an estimate of the number of chunks that will be sent from store-gateways to queriers.
+
+This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
+To configure the limit on a per-tenant basis, use the `-querier.max-estimated-fetched-chunks-per-query-multiplier` option (or `max_estimated_fetched_chunks_per_query_multiplier` in the runtime configuration).
+
+How to **fix** it:
+
+- Consider reducing the time range and/or cardinality of the query. To reduce the cardinality of the query, you can add more label matchers to the query, restricting the set of matching series.
+- Consider increasing the per-tenant limit by using the`-querier.max-estimated-fetched-chunks-per-query-multiplier` option (or `max_estimated_fetched_chunks_per_query_multiplier` in the runtime configuration).
+
 ### err-mimir-max-series-per-query
 
-This error occurs when a query execution exceeds the limit on the maximum number of series.
+This error occurs when execution of a query exceeds the limit on the maximum number of series.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-series-per-query` option (or `max_fetched_series_per_query` in the runtime configuration).
@@ -1485,7 +1507,7 @@ How to **fix** it:
 
 ### err-mimir-max-chunks-bytes-per-query
 
-This error occurs when a query execution exceeds the limit on aggregated size (in bytes) of fetched chunks.
+This error occurs when execution of a query exceeds the limit on aggregated size (in bytes) of fetched chunks.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-chunk-bytes-per-query` option (or `max_fetched_chunk_bytes_per_query` in the runtime configuration).
