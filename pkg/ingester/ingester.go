@@ -1614,14 +1614,14 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 
 	if streamType == QueryStreamChunks {
 		if req.StreamingChunksBatchSize > 0 {
-			level.Debug(spanlog).Log("msg", "using executeStreamingQuery")
+			spanlog.DebugLog("msg", "using executeStreamingQuery")
 			numSeries, numSamples, err = i.executeStreamingQuery(ctx, db, int64(from), int64(through), matchers, shard, stream, req.StreamingChunksBatchSize, spanlog)
 		} else {
-			level.Debug(spanlog).Log("msg", "using executeChunksQuery")
+			spanlog.DebugLog("msg", "using executeChunksQuery")
 			numSeries, numSamples, err = i.executeChunksQuery(ctx, db, int64(from), int64(through), matchers, shard, stream)
 		}
 	} else {
-		level.Debug(spanlog).Log("msg", "using executeSamplesQuery")
+		spanlog.DebugLog("msg", "using executeSamplesQuery")
 		numSeries, numSamples, err = i.executeSamplesQuery(ctx, db, int64(from), int64(through), matchers, shard, stream)
 	}
 	if err != nil {
@@ -1630,7 +1630,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 
 	i.metrics.queriedSeries.Observe(float64(numSeries))
 	i.metrics.queriedSamples.Observe(float64(numSamples))
-	level.Debug(spanlog).Log("series", numSeries, "samples", numSamples)
+	spanlog.DebugLog("series", numSeries, "samples", numSamples)
 	return nil
 }
 
@@ -1834,14 +1834,14 @@ func (i *Ingester) executeStreamingQuery(ctx context.Context, db *userTSDB, from
 		return 0, 0, err
 	}
 
-	level.Debug(spanlog).Log("msg", "finished sending series", "series", numSeries)
+	spanlog.DebugLog("msg", "finished sending series", "series", numSeries)
 
 	numSamples, numChunks, numBatches, err := i.sendStreamingQueryChunks(allSeries, stream, batchSize)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	level.Debug(spanlog).Log("msg", "finished sending chunks", "chunks", numChunks, "batches", numBatches)
+	spanlog.DebugLog("msg", "finished sending chunks", "chunks", numChunks, "batches", numBatches)
 
 	return numSeries, numSamples, nil
 }

@@ -561,7 +561,7 @@ func validateQueryTimeRange(ctx context.Context, userID string, startMs, endMs i
 // Ensure a time is within bounds, and log in traces to ease debugging.
 func clampTime(ctx context.Context, t model.Time, limit time.Duration, clamp model.Time, before bool, kind, name string, logger log.Logger) model.Time {
 	if limit > 0 && ((before && t.Before(clamp)) || (!before && t.After(clamp))) {
-		level.Debug(spanlogger.FromContext(ctx, logger)).Log(
+		spanlogger.FromContext(ctx, logger).DebugLog(
 			"msg", "the "+kind+" time of the query has been manipulated because of the '"+name+"' setting",
 			"original", util.FormatTimeModel(t),
 			"updated", util.FormatTimeModel(clamp))

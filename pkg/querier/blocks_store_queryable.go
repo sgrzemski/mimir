@@ -353,7 +353,7 @@ func (q *blocksStoreQuerier) LabelNames(matchers ...*labels.Matcher) ([]string, 
 
 	minT, maxT := q.minT, q.maxT
 
-	level.Debug(spanLog).Log("start", util.TimeFromMillis(minT).UTC().String(), "end",
+	spanLog.DebugLog("start", util.TimeFromMillis(minT).UTC().String(), "end",
 		util.TimeFromMillis(maxT).UTC().String(), "matchers", util.MatchersStringer(matchers))
 
 	{
@@ -395,7 +395,7 @@ func (q *blocksStoreQuerier) LabelValues(name string, matchers ...*labels.Matche
 
 	minT, maxT := q.minT, q.maxT
 
-	level.Debug(spanLog).Log("start", util.TimeFromMillis(minT).UTC().String(), "end",
+	spanLog.DebugLog("start", util.TimeFromMillis(minT).UTC().String(), "end",
 		util.TimeFromMillis(maxT).UTC().String(), "matchers", util.MatchersStringer(matchers))
 
 	{
@@ -474,21 +474,21 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 	}
 
 	if len(streamStarters) > 0 {
-		level.Debug(spanLog).Log("msg", "starting streaming")
+		spanLog.DebugLog("msg", "starting streaming")
 
 		// If this was a streaming call, start fetching streaming chunks here.
 		for _, ss := range streamStarters {
 			ss()
 		}
 
-		level.Debug(spanLog).Log("msg", "streaming started, waiting for chunks estimates")
+		spanLog.DebugLog("msg", "streaming started, waiting for chunks estimates")
 
 		chunksEstimate := 0
 		for _, chunkEstimator := range chunkEstimators {
 			chunksEstimate += chunkEstimator()
 		}
 
-		level.Debug(spanLog).Log("msg", "received chunks estimate from all store-gateways", "chunks_estimate", chunksEstimate)
+		spanLog.DebugLog("msg", "received chunks estimate from all store-gateways", "chunks_estimate", chunksEstimate)
 
 		if err := queryLimiter.AddEstimatedChunks(chunksEstimate); err != nil {
 			return storage.ErrSeriesSet(err)
@@ -998,7 +998,7 @@ func (q *blocksStoreQuerier) fetchLabelNamesFromStore(
 				myQueriedBlocks = ids
 			}
 
-			level.Debug(spanLog).Log("msg", "received label names from store-gateway",
+			spanLog.DebugLog("msg", "received label names from store-gateway",
 				"instance", c,
 				"num labels", len(namesResp.Names),
 				"requested blocks", strings.Join(convertULIDsToString(blockIDs), " "),
@@ -1079,7 +1079,7 @@ func (q *blocksStoreQuerier) fetchLabelValuesFromStore(
 				myQueriedBlocks = ids
 			}
 
-			level.Debug(spanLog).Log("msg", "received label values from store-gateway",
+			spanLog.DebugLog("msg", "received label values from store-gateway",
 				"instance", c.RemoteAddress(),
 				"num values", len(valuesResp.Values),
 				"requested blocks", strings.Join(convertULIDsToString(blockIDs), " "),
