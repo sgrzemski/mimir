@@ -1563,6 +1563,17 @@
           "fieldFlag": "distributor.write-requests-buffer-pooling-enabled",
           "fieldType": "boolean",
           "fieldCategory": "experimental"
+        },
+        {
+          "kind": "field",
+          "name": "retry_after_average",
+          "required": false,
+          "desc": "Average time to wait before retrying a 429/529 request.",
+          "fieldValue": null,
+          "fieldDefaultValue": 10000000000,
+          "fieldFlag": "distributor.retry-after-average",
+          "fieldType": "duration",
+          "fieldCategory": "experimental"
         }
       ],
       "fieldValue": null,
