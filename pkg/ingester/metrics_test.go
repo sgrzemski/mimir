@@ -158,11 +158,15 @@ func TestTSDBMetrics(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_mmap_chunk_corruptions_total counter
 			cortex_ingester_tsdb_mmap_chunk_corruptions_total 2577406
 
-			# HELP cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total Total number of memory-mapped TSDB chunk corruptions.
+			# HELP cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total Total number of memory-mapped TSDB chunk operations.
 			# TYPE cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total counter
 			cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total{operation="add"} 150
 			cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total{operation="complete"} 120
 			cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total{operation="get"} 30
+
+			# HELP cortex_ingester_tsdb_mmap_chunks_total Total number of chunks that were memory-mapped.
+			# TYPE cortex_ingester_tsdb_mmap_chunks_total counter
+			cortex_ingester_tsdb_mmap_chunks_total 2973930
 
 			# HELP cortex_ingester_tsdb_blocks_loaded Number of currently loaded data blocks
 			# TYPE cortex_ingester_tsdb_blocks_loaded gauge
@@ -235,10 +239,6 @@ func TestTSDBMetrics(t *testing.T) {
 			# HELP cortex_ingester_tsdb_exemplar_exemplars_in_storage Number of TSDB exemplars currently in storage.
 			# TYPE cortex_ingester_tsdb_exemplar_exemplars_in_storage gauge
 			cortex_ingester_tsdb_exemplar_exemplars_in_storage 30
-
-			# HELP cortex_ingester_tsdb_head_max_time_seconds Maximum timestamp of the head block across all tenants.
-			# TYPE cortex_ingester_tsdb_head_max_time_seconds gauge
-			cortex_ingester_tsdb_head_max_time_seconds 85787000
 	`))
 	require.NoError(t, err)
 }
@@ -373,6 +373,10 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			cortex_ingester_tsdb_head_chunks_removed_total{user="user1"} 296280
 			cortex_ingester_tsdb_head_chunks_removed_total{user="user2"} 2058888
 
+			# HELP cortex_ingester_tsdb_mmap_chunks_total Total number of chunks that were memory-mapped.
+			# TYPE cortex_ingester_tsdb_mmap_chunks_total counter
+			cortex_ingester_tsdb_mmap_chunks_total 2973930
+
 			# HELP cortex_ingester_tsdb_wal_truncate_duration_seconds Duration of TSDB WAL truncation.
 			# TYPE cortex_ingester_tsdb_wal_truncate_duration_seconds summary
 			cortex_ingester_tsdb_wal_truncate_duration_seconds_sum 75
@@ -382,7 +386,7 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_mmap_chunk_corruptions_total counter
 			cortex_ingester_tsdb_mmap_chunk_corruptions_total 2577406
 
-			# HELP cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total Total number of memory-mapped TSDB chunk corruptions.
+			# HELP cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total Total number of memory-mapped TSDB chunk operations.
 			# TYPE cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total counter
 			cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total{operation="add"} 150
 			cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total{operation="complete"} 120
@@ -453,10 +457,6 @@ func TestTSDBMetricsWithRemoval(t *testing.T) {
 			# TYPE cortex_ingester_tsdb_out_of_order_samples_appended_total counter
 			cortex_ingester_tsdb_out_of_order_samples_appended_total{user="user1"} 3
 			cortex_ingester_tsdb_out_of_order_samples_appended_total{user="user2"} 3
-
-			# HELP cortex_ingester_tsdb_head_max_time_seconds Maximum timestamp of the head block across all tenants.
-			# TYPE cortex_ingester_tsdb_head_max_time_seconds gauge
-			cortex_ingester_tsdb_head_max_time_seconds 85787000
 	`))
 	require.NoError(t, err)
 }
@@ -709,11 +709,11 @@ func populateTSDBMetrics(base float64) *prometheus.Registry {
 	})
 	outOfOrderSamplesAppendedTotal.Add(3)
 
-	maxTime := promauto.With(r).NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_head_max_time_seconds",
-		Help: "Maximum timestamp of the head block.",
+	chunksMmappedTotal := promauto.With(r).NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_mmap_chunks_total",
+		Help: "Total number of chunks that were memory-mapped.",
 	})
-	maxTime.Set(1000 * base)
+	chunksMmappedTotal.Add(30 * base)
 
 	return r
 }

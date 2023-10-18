@@ -27,10 +27,10 @@ var (
 )
 
 type RateLimitedLoggerCfg struct {
-	Enabled            bool
-	LogsPerSecond      float64
-	LogsPerSecondBurst int
-	Registry           prometheus.Registerer
+	Enabled       bool
+	LogsPerSecond float64
+	LogsBurstSize int
+	Registry      prometheus.Registerer
 }
 
 // InitLogger initialises the global gokit logger (util_log.Logger) and returns that logger.
@@ -41,17 +41,34 @@ func InitLogger(logFormat string, logLevel dslog.Level, buffered bool, rateLimit
 	if rateLimitedCfg.Enabled {
 		// use UTC timestamps and skip 6 stack frames if rate limited logger is needed.
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.Caller(6))
-		logger = dslog.NewRateLimitedLogger(logger, rateLimitedCfg.LogsPerSecond, rateLimitedCfg.LogsPerSecondBurst, rateLimitedCfg.Registry)
+		logger = dslog.NewRateLimitedLogger(logger, rateLimitedCfg.LogsPerSecond, rateLimitedCfg.LogsBurstSize, rateLimitedCfg.Registry)
 	} else {
 		// use UTC timestamps and skip 5 stack frames if no rate limited logger is needed.
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.Caller(5))
 	}
 	// Must put the level filter last for efficiency.
-	logger = level.NewFilter(logger, logLevel.Option)
+	logger = newFilter(logger, logLevel)
 
 	// Set global logger.
 	Logger = logger
 	return logger
+}
+
+// Pass through Logger and implement the DebugEnabled interface that spanlogger looks for.
+type levelFilter struct {
+	log.Logger
+	debugEnabled bool
+}
+
+func newFilter(logger log.Logger, lvl dslog.Level) log.Logger {
+	return &levelFilter{
+		Logger:       level.NewFilter(logger, lvl.Option),
+		debugEnabled: lvl.String() == "debug", // Using inside knowledge about the hierarchy of possible options.
+	}
+}
+
+func (f *levelFilter) DebugEnabled() bool {
+	return f.debugEnabled
 }
 
 func getWriter(buffered bool) io.Writer {

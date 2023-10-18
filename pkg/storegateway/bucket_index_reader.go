@@ -59,7 +59,9 @@ func newBucketIndexReader(block *bucketBlock, postingsStrategy postingsSelection
 		block:            block,
 		postingsStrategy: postingsStrategy,
 		dec: &index.Decoder{
-			LookupSymbol: block.indexHeaderReader.LookupSymbol,
+			LookupSymbol: func(_ context.Context, o uint32) (string, error) {
+				return block.indexHeaderReader.LookupSymbol(o)
+			},
 		},
 		indexHeaderReader: block.indexHeaderReader,
 	}
@@ -221,11 +223,11 @@ func (r *bucketIndexReader) expandedPostings(ctx context.Context, ms []*labels.M
 				postingIndex++
 			}
 
-			groupAdds = append(groupAdds, index.Merge(toMerge...))
+			groupAdds = append(groupAdds, index.Merge(ctx, toMerge...))
 		}
 	}
 
-	result := index.Without(index.Intersect(groupAdds...), index.Merge(groupRemovals...))
+	result := index.Without(index.Intersect(groupAdds...), index.Merge(ctx, groupRemovals...))
 
 	ps, err := index.ExpandPostings(result)
 	if err != nil {
@@ -718,14 +720,14 @@ func (r *bucketIndexReader) Close() error {
 }
 
 // LookupLabelsSymbols populates label set strings from symbolized label set.
-func (r *bucketIndexReader) LookupLabelsSymbols(symbolized []symbolizedLabel, builder *labels.ScratchBuilder) (labels.Labels, error) {
+func (r *bucketIndexReader) LookupLabelsSymbols(ctx context.Context, symbolized []symbolizedLabel, builder *labels.ScratchBuilder) (labels.Labels, error) {
 	builder.Reset()
 	for _, s := range symbolized {
-		ln, err := r.dec.LookupSymbol(s.name)
+		ln, err := r.dec.LookupSymbol(ctx, s.name)
 		if err != nil {
 			return labels.EmptyLabels(), errors.Wrap(err, "lookup label name")
 		}
-		lv, err := r.dec.LookupSymbol(s.value)
+		lv, err := r.dec.LookupSymbol(ctx, s.value)
 		if err != nil {
 			return labels.EmptyLabels(), errors.Wrap(err, "lookup label value")
 		}
@@ -763,12 +765,12 @@ func (l *bucketIndexLoadedSeries) addSeries(ref storage.SeriesRef, data []byte) 
 // Error is returned on decoding error or if the reference does not resolve to a known series.
 //
 // It's NOT safe to call this function concurrently with addSeries().
-func (l *bucketIndexLoadedSeries) unsafeLoadSeries(ref storage.SeriesRef, chks *[]chunks.Meta, strategy seriesIteratorStrategy, stats *queryStats, lsetPool *pool.SlabPool[symbolizedLabel]) (ok bool, _ []symbolizedLabel, err error) {
+func (l *bucketIndexLoadedSeries) unsafeLoadSeries(ref storage.SeriesRef, chks *[]chunks.Meta, skipChunks bool, stats *queryStats, lsetPool *pool.SlabPool[symbolizedLabel]) (ok bool, _ []symbolizedLabel, err error) {
 	b, ok := l.series[ref]
 	if !ok {
 		return false, nil, errors.Errorf("series %d not found", ref)
 	}
 	stats.seriesProcessed++
 	stats.seriesProcessedSizeSum += len(b)
-	return decodeSeries(b, lsetPool, chks, strategy)
+	return decodeSeries(b, lsetPool, chks, skipChunks)
 }

@@ -188,10 +188,12 @@ func (c *RemoteReadCommand) readClient() (remote.ReadClient, error) {
 		return nil, err
 	}
 
-	addressURL.Path = filepath.Join(
-		addressURL.Path,
-		c.remoteReadPath,
-	)
+	remoteReadPathURL, err := url.Parse(c.remoteReadPath)
+	if err != nil {
+		return nil, err
+	}
+
+	addressURL = addressURL.ResolveReference(remoteReadPathURL)
 
 	// build client
 	readClient, err := remote.NewReadClient("remote-read", &remote.ClientConfig{
@@ -416,8 +418,7 @@ func (c *RemoteReadCommand) export(_ *kingpin.ParseContext) error {
 	if err != nil {
 		return err
 	}
-
-	iterator := func() backfill.Iterator {
+	iteratorCreator := func() backfill.Iterator {
 		return newTimeSeriesIterator(timeseries)
 	}
 
@@ -434,7 +435,7 @@ func (c *RemoteReadCommand) export(_ *kingpin.ParseContext) error {
 	defer pipeR.Close()
 
 	log.Infof("Store TSDB blocks in '%s'", c.tsdbPath)
-	if err := backfill.CreateBlocks(iterator, int64(mint), int64(maxt), 1000, c.tsdbPath, true, pipeW); err != nil {
+	if err := backfill.CreateBlocks(iteratorCreator, int64(mint), int64(maxt), 1000, c.tsdbPath, true, pipeW); err != nil {
 		return err
 	}
 

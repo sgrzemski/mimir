@@ -6,6 +6,8 @@
 package ingester
 
 import (
+	"time"
+
 	"github.com/go-kit/log"
 	dskit_metrics "github.com/grafana/dskit/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +51,7 @@ type ingesterMetrics struct {
 	ingestionRate           prometheus.GaugeFunc
 	maxInflightPushRequests prometheus.GaugeFunc
 	inflightRequests        prometheus.GaugeFunc
+	inflightRequestsSummary prometheus.Summary
 
 	// Head compactions metrics.
 	compactionsTriggered   prometheus.Counter
@@ -241,6 +244,14 @@ func newIngesterMetrics(
 			return 0
 		}),
 
+		inflightRequestsSummary: promauto.With(r).NewSummary(prometheus.SummaryOpts{
+			Name:       "cortex_ingester_inflight_push_requests_summary",
+			Help:       "Number of inflight requests sampled at a regular interval. Quantile buckets keep track of inflight requests over the last 60s.",
+			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.95: 0.01, 0.99: 0.001, 1.00: 0.001},
+			MaxAge:     time.Minute,
+			AgeBuckets: 6,
+		}),
+
 		// Not registered automatically, but only if activeSeriesEnabled is true.
 		activeSeriesLoading: promauto.With(activeSeriesReg).NewGaugeVec(prometheus.GaugeOpts{
 			Name: "cortex_ingester_active_series_loading",
@@ -428,8 +439,8 @@ type tsdbMetrics struct {
 	tsdbChunksRemovedTotal            *prometheus.Desc
 	tsdbMmapChunkCorruptionTotal      *prometheus.Desc
 	tsdbMmapChunkQueueOperationsTotal *prometheus.Desc
+	tsdbMmapChunksTotal               *prometheus.Desc
 	tsdbOOOHistogram                  *prometheus.Desc
-	tsdbMaxTime                       *prometheus.Desc
 
 	tsdbExemplarsTotal          *prometheus.Desc
 	tsdbExemplarsInStorage      *prometheus.Desc
@@ -541,15 +552,15 @@ func newTSDBMetrics(r prometheus.Registerer, logger log.Logger) *tsdbMetrics {
 			nil, nil),
 		tsdbMmapChunkQueueOperationsTotal: prometheus.NewDesc(
 			"cortex_ingester_tsdb_mmap_chunk_write_queue_operations_total",
-			"Total number of memory-mapped TSDB chunk corruptions.",
+			"Total number of memory-mapped TSDB chunk operations.",
 			[]string{"operation"}, nil),
+		tsdbMmapChunksTotal: prometheus.NewDesc(
+			"cortex_ingester_tsdb_mmap_chunks_total",
+			"Total number of chunks that were memory-mapped.",
+			nil, nil),
 		tsdbOOOHistogram: prometheus.NewDesc(
 			"cortex_ingester_tsdb_sample_out_of_order_delta_seconds",
 			"Delta in seconds by which a sample is considered out-of-order.",
-			nil, nil),
-		tsdbMaxTime: prometheus.NewDesc(
-			"cortex_ingester_tsdb_head_max_time_seconds",
-			"Maximum timestamp of the head block across all tenants.",
 			nil, nil),
 		tsdbLoadedBlocks: prometheus.NewDesc(
 			"cortex_ingester_tsdb_blocks_loaded",
@@ -664,8 +675,8 @@ func (sm *tsdbMetrics) Describe(out chan<- *prometheus.Desc) {
 	out <- sm.tsdbChunksRemovedTotal
 	out <- sm.tsdbMmapChunkCorruptionTotal
 	out <- sm.tsdbMmapChunkQueueOperationsTotal
+	out <- sm.tsdbMmapChunksTotal
 	out <- sm.tsdbOOOHistogram
-	out <- sm.tsdbMaxTime
 	out <- sm.tsdbLoadedBlocks
 	out <- sm.tsdbSymbolTableSize
 	out <- sm.tsdbReloads
@@ -713,8 +724,8 @@ func (sm *tsdbMetrics) Collect(out chan<- prometheus.Metric) {
 	data.SendSumOfCountersPerTenant(out, sm.tsdbChunksRemovedTotal, "prometheus_tsdb_head_chunks_removed_total")
 	data.SendSumOfCounters(out, sm.tsdbMmapChunkCorruptionTotal, "prometheus_tsdb_mmap_chunk_corruptions_total")
 	data.SendSumOfCountersWithLabels(out, sm.tsdbMmapChunkQueueOperationsTotal, "prometheus_tsdb_chunk_write_queue_operations_total", "operation")
+	data.SendSumOfCounters(out, sm.tsdbMmapChunksTotal, "prometheus_tsdb_mmap_chunks_total")
 	data.SendSumOfHistograms(out, sm.tsdbOOOHistogram, "prometheus_tsdb_sample_ooo_delta")
-	data.SendMaxOfGauges(out, sm.tsdbMaxTime, "prometheus_tsdb_head_max_time_seconds")
 	data.SendSumOfGauges(out, sm.tsdbLoadedBlocks, "prometheus_tsdb_blocks_loaded")
 	data.SendSumOfGaugesPerTenant(out, sm.tsdbSymbolTableSize, "prometheus_tsdb_symbol_table_size_bytes")
 	data.SendSumOfCounters(out, sm.tsdbReloads, "prometheus_tsdb_reloads_total")

@@ -302,7 +302,7 @@ This alert fires when a Mimir process has a number of memory map areas close to 
 How to **fix** it:
 
 - Increase the limit on your system: `sysctl --write vm.max_map_count=<NEW LIMIT>`
-- If it's caused by a store-gateway, consider enabling `-blocks-storage.bucket-store.index-header-lazy-loading-enabled=true` to lazy mmap index-headers at query time
+- If it's caused by a store-gateway, consider enabling `-blocks-storage.bucket-store.index-header.lazy-loading-enabled=true` to lazy mmap index-headers at query time
 
 More information:
 
@@ -1178,6 +1178,22 @@ How to **investigate**:
   {name="rollout-operator",namespace="<namespace>"}
   ```
 
+### MimirIngestedDataTooFarInTheFuture
+
+This alert fires when Mimir ingester accepts a sample with timestamp that is too far in the future.
+This is typically a result of processing of corrupted message, and it can cause rejection of other samples with timestamp close to "now" (real-world time).
+
+How it **works**:
+
+- The metric exported by ingester computes maximum timestamp from all TSDBs open in ingester.
+- Alert checks this exported metric and fires if maximum timestamp is more than 1h in the future.
+
+How to **investigate**
+
+- Find the tenant with bad sample on ingester's tenants list, where a warning "TSDB Head max timestamp too far in the future" is displayed.
+- Flush tenant's data to blocks storage.
+- Remove tenant's directory on disk and restart ingester.
+
 ## Errors catalog
 
 Mimir has some codified error IDs that you might see in HTTP responses or logs.
@@ -1469,7 +1485,7 @@ How to **fix** it:
 
 ### err-mimir-max-chunks-per-query
 
-This error occurs when a query execution exceeds the limit on the number of series chunks fetched.
+This error occurs when execution of a query exceeds the limit on the number of series chunks fetched.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-chunks-per-query` option (or `max_fetched_chunks_per_query` in the runtime configuration).
@@ -1479,9 +1495,23 @@ How to **fix** it:
 - Consider reducing the time range and/or cardinality of the query. To reduce the cardinality of the query, you can add more label matchers to the query, restricting the set of matching series.
 - Consider increasing the per-tenant limit by using the `-querier.max-fetched-chunks-per-query` option (or `max_fetched_chunks_per_query` in the runtime configuration).
 
+### err-mimir-max-estimated-chunks-per-query
+
+This error occurs when execution of a query exceeds the limit on the estimated number of series chunks expected to be fetched.
+
+The estimate is based on the actual number of chunks that will be sent from ingesters to queriers, and an estimate of the number of chunks that will be sent from store-gateways to queriers.
+
+This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
+To configure the limit on a per-tenant basis, use the `-querier.max-estimated-fetched-chunks-per-query-multiplier` option (or `max_estimated_fetched_chunks_per_query_multiplier` in the runtime configuration).
+
+How to **fix** it:
+
+- Consider reducing the time range and/or cardinality of the query. To reduce the cardinality of the query, you can add more label matchers to the query, restricting the set of matching series.
+- Consider increasing the per-tenant limit by using the`-querier.max-estimated-fetched-chunks-per-query-multiplier` option (or `max_estimated_fetched_chunks_per_query_multiplier` in the runtime configuration).
+
 ### err-mimir-max-series-per-query
 
-This error occurs when a query execution exceeds the limit on the maximum number of series.
+This error occurs when execution of a query exceeds the limit on the maximum number of series.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-series-per-query` option (or `max_fetched_series_per_query` in the runtime configuration).
@@ -1493,7 +1523,7 @@ How to **fix** it:
 
 ### err-mimir-max-chunks-bytes-per-query
 
-This error occurs when a query execution exceeds the limit on aggregated size (in bytes) of fetched chunks.
+This error occurs when execution of a query exceeds the limit on aggregated size (in bytes) of fetched chunks.
 
 This limit is used to protect the system’s stability from potential abuse or mistakes, when running a query fetching a huge amount of data.
 To configure the limit on a per-tenant basis, use the `-querier.max-fetched-chunk-bytes-per-query` option (or `max_fetched_chunk_bytes_per_query` in the runtime configuration).
@@ -1673,6 +1703,19 @@ How it **works**:
 How to **fix** it:
 
 - Increase the allowed limit by using the `-distributor.max-recv-msg-size` option.
+
+### err-mimir-query-blocked
+
+This error occurs when a query-frontend blocks a read request because the query matches at least one of the rules defined in the limits.
+
+How it **works**:
+
+- The query-frontend implements a middleware responsible for assessing whether the query is blocked or not.
+- To configure the limit, set the block `blocked_queries` in the `limits`.
+
+How to **fix** it:
+
+This error only occurs when an administrator has explicitly define a blocked list for a given tenant. After assessing whether or not the reason for blocking one or multiple queries you can update the tenant's limits and remove the pattern.
 
 ## Mimir routes by path
 
@@ -1888,9 +1931,9 @@ A PVC can be manually deleted by an operator. When a PVC claim is deleted, what 
 
 _This runbook assumes you've enabled versioning in your GCS bucket and the retention of deleted blocks didn't expire yet._
 
-#### Recover accidentally deleted blocks using `undelete_block_gcs`
+#### Recover accidentally deleted blocks using `undelete-block-gcs`
 
-Step 1: Compile the `undelete_block_gcs` tool, whose sources are available in the Mimir repository at `tools/undelete_block_gcs/`.
+Step 1: Compile the `undelete-block-gcs` tool, whose sources are available in the Mimir repository at `tools/undelete-block-gcs/`.
 
 Step 2: Build a list of TSDB blocks to undelete and store it to a file named `deleted-list`. The file should contain the path of 1 block per line, prefixed by `gs://`. For example:
 
@@ -1900,13 +1943,13 @@ gs://bucket/tenant-1/01H6NCR7HSZ8DHKEG9SSJ0QZKQ
 gs://bucket/tenant-1/01H6NCRBJTY8R1F4FQJ3B1QK9W
 ```
 
-Step 3: Run the `undelete_block_gcs` tool to recover the deleted blocks:
+Step 3: Run the `undelete-block-gcs` tool to recover the deleted blocks:
 
 ```
-cat deleted-list | undelete_block_gcs -concurrency 16
+cat deleted-list | undelete-block-gcs -concurrency 16
 ```
 
-> **Note**: we recommend to try the `undelete_block_gcs` on a single block first, ensure that it gets recovered correctly and then run it against a bigger set of blocks to recover.
+> **Note**: we recommend to try the `undelete-block-gcs` on a single block first, ensure that it gets recovered correctly and then run it against a bigger set of blocks to recover.
 
 #### Recover accidentally deleted blocks using `gsutil`
 

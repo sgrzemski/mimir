@@ -26,7 +26,6 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/grafana/dskit/concurrency"
-	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/tenant"
@@ -65,7 +64,6 @@ import (
 	"github.com/grafana/mimir/pkg/util/limiter"
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	util_math "github.com/grafana/mimir/pkg/util/math"
-	"github.com/grafana/mimir/pkg/util/push"
 	"github.com/grafana/mimir/pkg/util/shutdownmarker"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 	"github.com/grafana/mimir/pkg/util/validation"
@@ -117,6 +115,7 @@ const (
 	// Value used to track the limit between sequential and concurrent TSDB opernings.
 	// Below this value, TSDBs of different tenants are opened sequentially, otherwise concurrently.
 	maxTSDBOpenWithoutConcurrency = 10
+	tooBusyErrorMsg               = "the ingester is currently too busy to process queries, try again later"
 )
 
 var (
@@ -124,6 +123,11 @@ var (
 	reasonIngesterMaxTenants              = globalerror.IngesterMaxTenants.LabelValue()
 	reasonIngesterMaxInMemorySeries       = globalerror.IngesterMaxInMemorySeries.LabelValue()
 	reasonIngesterMaxInflightPushRequests = globalerror.IngesterMaxInflightPushRequests.LabelValue()
+	// This is the closest fitting Prometheus API error code for requests rejected due to limiting.
+	tooBusyError = newErrorWithHTTPStatus(
+		errors.New(tooBusyErrorMsg),
+		http.StatusServiceUnavailable,
+	)
 )
 
 // BlocksUploader interface is used to have an easy way to mock it in tests.
@@ -171,6 +175,10 @@ type Config struct {
 	ReadPathCPUUtilizationLimit          float64 `yaml:"read_path_cpu_utilization_limit" category:"experimental"`
 	ReadPathMemoryUtilizationLimit       uint64  `yaml:"read_path_memory_utilization_limit" category:"experimental"`
 	LogUtilizationBasedLimiterCPUSamples bool    `yaml:"log_utilization_based_limiter_cpu_samples" category:"experimental"`
+
+	LimitInflightRequestsUsingGrpcMethodLimiter bool `yaml:"limit_inflight_requests_using_grpc_method_limiter" category:"experimental"`
+
+	ErrorSampleRate int64 `yaml:"error_sample_rate" json:"error_sample_rate" category:"experimental"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -187,9 +195,15 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
 	f.Float64Var(&cfg.ReadPathCPUUtilizationLimit, "ingester.read-path-cpu-utilization-limit", 0, "CPU utilization limit, as CPU cores, for CPU/memory utilization based read request limiting. Use 0 to disable it.")
 	f.Uint64Var(&cfg.ReadPathMemoryUtilizationLimit, "ingester.read-path-memory-utilization-limit", 0, "Memory limit, in bytes, for CPU/memory utilization based read request limiting. Use 0 to disable it.")
 	f.BoolVar(&cfg.LogUtilizationBasedLimiterCPUSamples, "ingester.log-utilization-based-limiter-cpu-samples", false, "Enable logging of utilization based limiter CPU samples.")
+	f.BoolVar(&cfg.LimitInflightRequestsUsingGrpcMethodLimiter, "ingester.limit-inflight-requests-using-grpc-method-limiter", false, "Use experimental method of limiting push requests.")
+	f.Int64Var(&cfg.ErrorSampleRate, "ingester.error-sample-rate", 0, "Each error will be logged once in this many times. Use 0 to log all of them.")
 }
 
 func (cfg *Config) Validate() error {
+	if cfg.ErrorSampleRate < 0 {
+		return fmt.Errorf("error sample rate cannot be a negative number")
+	}
+
 	return cfg.IngesterRing.Validate()
 }
 
@@ -276,6 +290,8 @@ type Ingester struct {
 	maxOutOfOrderTimeWindowSecondsStat *expvar.Int
 
 	utilizationBasedLimiter utilizationBasedLimiter
+
+	errorSamplers ingesterErrSamplers
 }
 
 func newIngester(cfg Config, limits *validation.Overrides, registerer prometheus.Registerer, logger log.Logger) (*Ingester, error) {
@@ -313,6 +329,8 @@ func newIngester(cfg Config, limits *validation.Overrides, registerer prometheus
 		tenantsWithOutOfOrderEnabledStat:   usagestats.GetAndResetInt(tenantsWithOutOfOrderEnabledStatName),
 		minOutOfOrderTimeWindowSecondsStat: usagestats.GetAndResetInt(minOutOfOrderTimeWindowSecondsStatName),
 		maxOutOfOrderTimeWindowSecondsStat: usagestats.GetAndResetInt(maxOutOfOrderTimeWindowSecondsStatName),
+
+		errorSamplers: newIngesterErrSamplers(cfg.ErrorSampleRate),
 	}, nil
 }
 
@@ -331,6 +349,16 @@ func New(cfg Config, limits *validation.Overrides, activeGroupsCleanupService *u
 			Name: "cortex_ingester_oldest_unshipped_block_timestamp_seconds",
 			Help: "Unix timestamp of the oldest TSDB block not shipped to the storage yet. 0 if ingester has no blocks or all blocks have been shipped.",
 		}, i.getOldestUnshippedBlockMetric)
+
+		promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "cortex_ingester_tsdb_head_min_timestamp_seconds",
+			Help: "Minimum timestamp of the head block across all tenants.",
+		}, i.minTsdbHeadTimestamp)
+
+		promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "cortex_ingester_tsdb_head_max_timestamp_seconds",
+			Help: "Maximum timestamp of the head block across all tenants.",
+		}, i.maxTsdbHeadTimestamp)
 	}
 
 	i.lifecycler, err = ring.NewLifecycler(cfg.IngesterRing.ToLifecyclerConfig(logger), i, "ingester", IngesterRingKey, cfg.BlocksStorageConfig.TSDB.FlushBlocksOnShutdown, logger, prometheus.WrapRegistererWithPrefix("cortex_", registerer))
@@ -345,7 +373,8 @@ func New(cfg Config, limits *validation.Overrides, activeGroupsCleanupService *u
 		limits,
 		i.lifecycler,
 		cfg.IngesterRing.ReplicationFactor,
-		cfg.IngesterRing.ZoneAwarenessEnabled)
+		cfg.IngesterRing.ZoneAwarenessEnabled,
+	)
 
 	if cfg.ReadPathCPUUtilizationLimit > 0 || cfg.ReadPathMemoryUtilizationLimit > 0 {
 		i.utilizationBasedLimiter = limiter.NewUtilizationBasedLimiter(cfg.ReadPathCPUUtilizationLimit,
@@ -486,6 +515,23 @@ func (i *Ingester) stopping(_ error) error {
 }
 
 func (i *Ingester) updateLoop(ctx context.Context) error {
+
+	// Launch a dedicated goroutine for inflightRequestsTicker
+	// to ensure it operates independently, unaffected by delays from other logics in updateLoop.
+	go func() {
+		inflightRequestsTicker := time.NewTicker(250 * time.Millisecond)
+		defer inflightRequestsTicker.Stop()
+
+		for {
+			select {
+			case <-inflightRequestsTicker.C:
+				i.metrics.inflightRequestsSummary.Observe(float64(i.inflightPushRequests.Load()))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	rateUpdateTicker := time.NewTicker(i.cfg.RateUpdatePeriod)
 	defer rateUpdateTicker.Stop()
 
@@ -709,43 +755,67 @@ type pushStats struct {
 	perMetricSeriesLimitCount int
 }
 
-// PushWithCleanup is the Push() implementation for blocks storage and takes a WriteRequest and adds it to the TSDB head.
-func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
-	// NOTE: because we use `unsafe` in deserialisation, we must not
-	// retain anything from `req` past the exit from this function.
-	defer pushReq.CleanUp()
-
-	if err := i.checkRunning(); err != nil {
-		return nil, util_log.DoNotLogError{Err: err}
+// StartPushRequest checks if ingester can start push request, and increments relevant counters.
+// If new push request cannot be started, errors converible to gRPC status code are returned, and metrics are updated.
+//
+// This method can be called in two ways: 1. Ingester.PushWithCleanup, or 2. from gRPC server's method limiter.
+//
+// In the first case, returned errors can be inspected/logged by middleware. Ingester.PushWithCleanup will wrap the error in util_log.DoNotLogError wrapper.
+//
+// In the second case, returned errors will not be logged, because request will not reach any middleware.
+func (i *Ingester) StartPushRequest() error {
+	if err := i.checkAvailable(); err != nil {
+		return err
 	}
 
-	// We will report *this* request in the error too.
 	inflight := i.inflightPushRequests.Inc()
-	defer i.inflightPushRequests.Dec()
+	decreaseInflightInDefer := true
+	defer func() {
+		if decreaseInflightInDefer {
+			i.inflightPushRequests.Dec()
+		}
+	}()
 
 	il := i.getInstanceLimits()
 	if il != nil && il.MaxInflightPushRequests > 0 {
 		if inflight > il.MaxInflightPushRequests {
 			i.metrics.rejected.WithLabelValues(reasonIngesterMaxInflightPushRequests).Inc()
-			return nil, errMaxInflightRequestsReached
+			return errMaxInflightRequestsReached
 		}
-	}
-
-	userID, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, err
 	}
 
 	if il != nil && il.MaxIngestionRate > 0 {
 		if rate := i.ingestionRate.Rate(); rate >= il.MaxIngestionRate {
 			i.metrics.rejected.WithLabelValues(reasonIngesterMaxIngestionRate).Inc()
-			return nil, errMaxIngestionRateReached
+			return errMaxIngestionRateReached
 		}
 	}
 
-	req, err := pushReq.WriteRequest()
+	decreaseInflightInDefer = false
+	return nil
+}
+
+func (i *Ingester) FinishPushRequest() {
+	i.inflightPushRequests.Dec()
+}
+
+// PushWithCleanup is the Push() implementation for blocks storage and takes a WriteRequest and adds it to the TSDB head.
+func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteRequest, cleanUp func()) error {
+	// NOTE: because we use `unsafe` in deserialisation, we must not
+	// retain anything from `req` past the exit from this function.
+	defer cleanUp()
+
+	// If we're using grpc handlers, we don't need to start/finish request here.
+	if !i.cfg.LimitInflightRequestsUsingGrpcMethodLimiter {
+		if err := i.StartPushRequest(); err != nil {
+			return util_log.DoNotLogError{Err: err}
+		}
+		defer i.FinishPushRequest()
+	}
+
+	userID, err := tenant.TenantID(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Given metadata is a best-effort approach, and we don't halt on errors
@@ -757,28 +827,23 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (
 
 	// Early exit if no timeseries in request - don't create a TSDB or an appender.
 	if len(req.Timeseries) == 0 {
-		return &mimirpb.WriteResponse{}, nil
+		return nil
 	}
 
 	db, err := i.getOrCreateTSDB(userID, false)
 	if err != nil {
-		// Check for a particular per-instance limit and return that error directly
-		// since it contains extra information for gRPC and our logging middleware.
-		if errors.Is(err, errMaxTenantsReached) {
-			return nil, err
-		}
-		return nil, wrapWithUser(err, userID)
+		return wrapOrAnnotateWithUser(err, userID)
 	}
 
 	lockState, err := db.acquireAppendLock(req.MinTimestamp())
 	if err != nil {
-		return &mimirpb.WriteResponse{}, httpgrpc.Errorf(http.StatusServiceUnavailable, wrapWithUser(err, userID).Error())
+		return wrapOrAnnotateWithUser(err, userID)
 	}
 	defer db.releaseAppendLock(lockState)
 
 	// Note that we don't .Finish() the span in this method on purpose
 	spanlog := spanlogger.FromContext(ctx, i.logger)
-	level.Debug(spanlog).Log("event", "acquired append lock")
+	spanlog.DebugLog("event", "acquired append lock")
 
 	var (
 		startAppend = time.Now()
@@ -787,17 +852,25 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (
 		// successfully committed
 		stats pushStats
 
-		firstPartialErr    error
-		updateFirstPartial = func(errFn func() error) {
+		firstPartialErr error
+		// updateFirstPartial is a function that, in case of a softError, stores that error
+		// in firstPartialError, and makes PushWithCleanup proceed. This way all the valid
+		// samples and exemplars will be we actually ingested, and the first softError that
+		// was encountered will be returned. If a sampler is specified, the softError gets
+		// wrapped by that sampler.
+		updateFirstPartial = func(sampler *util_log.Sampler, errFn softErrorFunction) {
 			if firstPartialErr == nil {
 				firstPartialErr = errFn()
+				if sampler != nil {
+					firstPartialErr = sampler.WrapError(firstPartialErr)
+				}
 			}
 		}
 	)
 
 	// Walk the samples, appending them to the users database
 	app := db.Appender(ctx).(extendedAppender)
-	level.Debug(spanlog).Log("event", "got appender for timeseries", "series", len(req.Timeseries))
+	spanlog.DebugLog("event", "got appender for timeseries", "series", len(req.Timeseries))
 
 	var activeSeries *activeseries.ActiveSeries
 	if i.cfg.ActiveSeriesMetrics.Enabled {
@@ -812,18 +885,13 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (
 			level.Warn(i.logger).Log("msg", "failed to rollback appender on error", "user", userID, "err", err)
 		}
 
-		// Check for a particular per-instance limit and return that error directly
-		// since it contains extra information for gRPC and our logging middleware.
-		if errors.Is(err, errMaxInMemorySeriesReached) {
-			return nil, err
-		}
-		return nil, wrapWithUser(err, userID)
+		return wrapOrAnnotateWithUser(err, userID)
 	}
 
 	// At this point all samples have been added to the appender, so we can track the time it took.
 	i.metrics.appenderAddDuration.Observe(time.Since(startAppend).Seconds())
 
-	level.Debug(spanlog).Log(
+	spanlog.DebugLog(
 		"event", "start commit",
 		"succeededSamplesCount", stats.succeededSamplesCount,
 		"failedSamplesCount", stats.failedSamplesCount,
@@ -833,12 +901,12 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (
 
 	startCommit := time.Now()
 	if err := app.Commit(); err != nil {
-		return nil, wrapWithUser(err, userID)
+		return wrapOrAnnotateWithUser(err, userID)
 	}
 
 	commitDuration := time.Since(startCommit)
 	i.metrics.appenderCommitDuration.Observe(commitDuration.Seconds())
-	level.Debug(spanlog).Log("event", "complete commit", "commitDuration", commitDuration.String())
+	spanlog.DebugLog("event", "complete commit", "commitDuration", commitDuration.String())
 
 	// If only invalid samples are pushed, don't change "last update", as TSDB was not modified.
 	if stats.succeededSamplesCount > 0 {
@@ -860,15 +928,10 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, pushReq *push.Request) (
 	i.updateMetricsFromPushStats(userID, group, &stats, req.Source, db, i.metrics.discarded)
 
 	if firstPartialErr != nil {
-		code := http.StatusBadRequest
-		var ve *validationError
-		if errors.As(firstPartialErr, &ve) {
-			code = ve.code
-		}
-		return &mimirpb.WriteResponse{}, httpgrpc.Errorf(code, wrapWithUser(firstPartialErr, userID).Error())
+		return wrapOrAnnotateWithUser(firstPartialErr, userID)
 	}
 
-	return &mimirpb.WriteResponse{}, nil
+	return nil
 }
 
 func (i *Ingester) updateMetricsFromPushStats(userID string, group string, stats *pushStats, samplesSource mimirpb.WriteRequest_SourceEnum, db *userTSDB, discarded *discardedMetrics) {
@@ -905,9 +968,10 @@ func (i *Ingester) updateMetricsFromPushStats(userID string, group string, stats
 }
 
 // pushSamplesToAppender appends samples and exemplars to the appender. Most errors are handled via updateFirstPartial function,
-// but in case of unhandled errors, appender is rolled back and such error is returned.
+// but in case of unhandled errors, appender is rolled back and such error is returned. Errors handled by updateFirstPartial
+// must be of type softError.
 func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.PreallocTimeseries, app extendedAppender, startAppend time.Time,
-	stats *pushStats, updateFirstPartial func(errFn func() error), activeSeries *activeseries.ActiveSeries,
+	stats *pushStats, updateFirstPartial func(sampler *util_log.Sampler, errFn softErrorFunction), activeSeries *activeseries.ActiveSeries,
 	outOfOrderWindow time.Duration, minAppendTimeAvailable bool, minAppendTime int64) error {
 
 	// Return true if handled as soft error, and we can ingest more series.
@@ -922,50 +986,50 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 		switch cause := errors.Cause(err); cause {
 		case storage.ErrOutOfBounds:
 			stats.sampleOutOfBoundsCount++
-			updateFirstPartial(func() error {
-				return newIngestErrSampleTimestampTooOld(model.Time(timestamp), labels)
+			updateFirstPartial(i.errorSamplers.sampleTimestampTooOld, func() softError {
+				return newSampleTimestampTooOldError(model.Time(timestamp), labels)
 			})
 			return true
 
 		case storage.ErrOutOfOrderSample:
 			stats.sampleOutOfOrderCount++
-			updateFirstPartial(func() error {
-				return newIngestErrSampleOutOfOrder(model.Time(timestamp), labels)
+			updateFirstPartial(i.errorSamplers.sampleOutOfOrder, func() softError {
+				return newSampleOutOfOrderError(model.Time(timestamp), labels)
 			})
 			return true
 
 		case storage.ErrTooOldSample:
 			stats.sampleTooOldCount++
-			updateFirstPartial(func() error {
-				return newIngestErrSampleTimestampTooOldOOOEnabled(model.Time(timestamp), labels, outOfOrderWindow)
+			updateFirstPartial(i.errorSamplers.sampleTimestampTooOldOOOEnabled, func() softError {
+				return newSampleTimestampTooOldOOOEnabledError(model.Time(timestamp), labels, outOfOrderWindow)
 			})
 			return true
 
 		case globalerror.SampleTooFarInFuture:
 			stats.sampleTooFarInFutureCount++
-			updateFirstPartial(func() error {
-				return newIngestErrSampleTimestampTooFarInFuture(model.Time(timestamp), labels)
+			updateFirstPartial(i.errorSamplers.sampleTimestampTooFarInFuture, func() softError {
+				return newSampleTimestampTooFarInFutureError(model.Time(timestamp), labels)
 			})
 			return true
 
 		case storage.ErrDuplicateSampleForTimestamp:
 			stats.newValueForTimestampCount++
-			updateFirstPartial(func() error {
-				return newIngestErrSampleDuplicateTimestamp(model.Time(timestamp), labels)
+			updateFirstPartial(i.errorSamplers.sampleDuplicateTimestamp, func() softError {
+				return newSampleDuplicateTimestampError(model.Time(timestamp), labels)
 			})
 			return true
 
-		case errMaxSeriesPerUserLimitExceeded:
+		case globalerror.MaxSeriesPerUser:
 			stats.perUserSeriesLimitCount++
-			updateFirstPartial(func() error {
-				return makeLimitError(i.limiter.FormatError(userID, cause))
+			updateFirstPartial(i.errorSamplers.maxSeriesPerUserLimitExceeded, func() softError {
+				return newPerUserSeriesLimitReachedError(i.limiter.limits.MaxGlobalSeriesPerUser(userID))
 			})
 			return true
 
-		case errMaxSeriesPerMetricLimitExceeded:
+		case globalerror.MaxSeriesPerMetric:
 			stats.perMetricSeriesLimitCount++
-			updateFirstPartial(func() error {
-				return makeMetricLimitError(mimirpb.FromLabelAdaptersToLabelsWithCopy(labels), i.limiter.FormatError(userID, cause))
+			updateFirstPartial(i.errorSamplers.maxSeriesPerMetricLimitExceeded, func() softError {
+				return newPerMetricSeriesLimitReachedError(i.limiter.limits.MaxGlobalSeriesPerMetric(userID), mimirpb.FromLabelAdaptersToLabelsWithCopy(labels))
 			})
 			return true
 		}
@@ -1005,8 +1069,8 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 					firstTimestamp = ts.Histograms[0].Timestamp
 				}
 
-				updateFirstPartial(func() error {
-					return newIngestErrSampleTimestampTooOld(model.Time(firstTimestamp), ts.Labels)
+				updateFirstPartial(i.errorSamplers.sampleTimestampTooOld, func() softError {
+					return newSampleTimestampTooOldError(model.Time(firstTimestamp), ts.Labels)
 				})
 				continue
 			}
@@ -1020,8 +1084,8 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 
 				firstTimestamp := ts.Samples[0].TimestampMs
 
-				updateFirstPartial(func() error {
-					return newIngestErrSampleTimestampTooOld(model.Time(firstTimestamp), ts.Labels)
+				updateFirstPartial(i.errorSamplers.sampleTimestampTooOld, func() softError {
+					return newSampleTimestampTooOldError(model.Time(firstTimestamp), ts.Labels)
 				})
 				continue
 			}
@@ -1139,16 +1203,16 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 			// app.AppendExemplar currently doesn't create the series, it must
 			// already exist.  If it does not then drop.
 			if ref == 0 {
-				updateFirstPartial(func() error {
-					return newIngestErrExemplarMissingSeries(model.Time(ts.Exemplars[0].TimestampMs), ts.Labels, ts.Exemplars[0].Labels)
+				updateFirstPartial(nil, func() softError {
+					return newExemplarMissingSeriesError(model.Time(ts.Exemplars[0].TimestampMs), ts.Labels, ts.Exemplars[0].Labels)
 				})
 				stats.failedExemplarsCount += len(ts.Exemplars)
 			} else { // Note that else is explicit, rather than a continue in the above if, in case of additional logic post exemplar processing.
 				for _, ex := range ts.Exemplars {
 					if ex.TimestampMs > maxTimestampMs {
 						stats.failedExemplarsCount++
-						updateFirstPartial(func() error {
-							return newIngestErrExemplarTimestampTooFarInFuture(model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
+						updateFirstPartial(nil, func() softError {
+							return newExemplarTimestampTooFarInFutureError(model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
 						})
 						continue
 					}
@@ -1167,8 +1231,11 @@ func (i *Ingester) pushSamplesToAppender(userID string, timeseries []mimirpb.Pre
 					}
 
 					// Error adding exemplar
-					updateFirstPartial(func() error {
-						return wrappedTSDBIngestExemplarOtherErr(err, model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
+					updateFirstPartial(nil, func() softError {
+						if err == nil {
+							return nil
+						}
+						return newTSDBIngestExemplarErr(err, model.Time(ex.TimestampMs), ts.Labels, ex.Labels)
 					})
 					stats.failedExemplarsCount++
 				}
@@ -1258,13 +1325,13 @@ func (i *Ingester) LabelValues(ctx context.Context, req *client.LabelValuesReque
 		return &client.LabelValuesResponse{}, nil
 	}
 
-	q, err := db.Querier(ctx, startTimestampMs, endTimestampMs)
+	q, err := db.Querier(startTimestampMs, endTimestampMs)
 	if err != nil {
 		return nil, err
 	}
 	defer q.Close()
 
-	vals, _, err := q.LabelValues(labelName, matchers...)
+	vals, _, err := q.LabelValues(ctx, labelName, matchers...)
 	if err != nil {
 		return nil, err
 	}
@@ -1297,13 +1364,13 @@ func (i *Ingester) LabelNames(ctx context.Context, req *client.LabelNamesRequest
 		return nil, err
 	}
 
-	q, err := db.Querier(ctx, mint, maxt)
+	q, err := db.Querier(mint, maxt)
 	if err != nil {
 		return nil, err
 	}
 	defer q.Close()
 
-	names, _, err := q.LabelNames(matchers...)
+	names, _, err := q.LabelNames(ctx, matchers...)
 	if err != nil {
 		return nil, err
 	}
@@ -1339,7 +1406,7 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 	}
 
 	mint, maxt := req.StartTimestampMs, req.EndTimestampMs
-	q, err := db.Querier(ctx, mint, maxt)
+	q, err := db.Querier(mint, maxt)
 	if err != nil {
 		return nil, err
 	}
@@ -1360,7 +1427,7 @@ func (i *Ingester) MetricsForLabelMatchers(ctx context.Context, req *client.Metr
 			Func:  "series", // There is no series function, this token is used for lookups that don't need samples.
 		}
 
-		seriesSet := q.Select(true, hints, matchers...)
+		seriesSet := q.Select(ctx, true, hints, matchers...)
 		sets = append(sets, seriesSet)
 	}
 
@@ -1435,7 +1502,7 @@ func (i *Ingester) AllUserStats(_ context.Context, req *client.UserStatsRequest)
 // So, 1 MB limit will prevent reaching the limit and won't affect performance significantly.
 const labelNamesAndValuesTargetSizeBytes = 1 * 1024 * 1024
 
-func (i *Ingester) LabelNamesAndValues(request *client.LabelNamesAndValuesRequest, server client.Ingester_LabelNamesAndValuesServer) error {
+func (i *Ingester) LabelNamesAndValues(request *client.LabelNamesAndValuesRequest, stream client.Ingester_LabelNamesAndValuesServer) error {
 	if err := i.checkRunning(); err != nil {
 		return err
 	}
@@ -1443,7 +1510,7 @@ func (i *Ingester) LabelNamesAndValues(request *client.LabelNamesAndValuesReques
 		return err
 	}
 
-	userID, err := tenant.TenantID(server.Context())
+	userID, err := tenant.TenantID(stream.Context())
 	if err != nil {
 		return err
 	}
@@ -1460,7 +1527,7 @@ func (i *Ingester) LabelNamesAndValues(request *client.LabelNamesAndValuesReques
 	if err != nil {
 		return err
 	}
-	return labelNamesAndValues(index, matchers, labelNamesAndValuesTargetSizeBytes, server)
+	return labelNamesAndValues(index, matchers, labelNamesAndValuesTargetSizeBytes, stream)
 }
 
 // labelValuesCardinalityTargetSizeBytes is the maximum allowed size in bytes for label cardinality response.
@@ -1495,13 +1562,13 @@ func (i *Ingester) LabelValuesCardinality(req *client.LabelValuesCardinalityRequ
 		return err
 	}
 
-	var postingsForMatchersFn func(ix tsdb.IndexPostingsReader, ms ...*labels.Matcher) (index.Postings, error)
+	var postingsForMatchersFn func(context.Context, tsdb.IndexPostingsReader, ...*labels.Matcher) (index.Postings, error)
 	switch req.GetCountMethod() {
 	case client.IN_MEMORY:
 		postingsForMatchersFn = tsdb.PostingsForMatchers
 	case client.ACTIVE:
-		postingsForMatchersFn = func(ix tsdb.IndexPostingsReader, ms ...*labels.Matcher) (index.Postings, error) {
-			postings, err := tsdb.PostingsForMatchers(ix, ms...)
+		postingsForMatchersFn = func(ctx context.Context, ix tsdb.IndexPostingsReader, ms ...*labels.Matcher) (index.Postings, error) {
+			postings, err := tsdb.PostingsForMatchers(ctx, ix, ms...)
 			if err != nil {
 				return nil, err
 			}
@@ -1625,7 +1692,7 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 }
 
 func (i *Ingester) executeSamplesQuery(ctx context.Context, db *userTSDB, from, through int64, matchers []*labels.Matcher, shard *sharding.ShardSelector, stream client.Ingester_QueryStreamServer) (numSeries, numSamples int, _ error) {
-	q, err := db.Querier(ctx, from, through)
+	q, err := db.Querier(from, through)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1637,7 +1704,7 @@ func (i *Ingester) executeSamplesQuery(ctx context.Context, db *userTSDB, from, 
 	}
 
 	// It's not required to return sorted series because series are sorted by the Mimir querier.
-	ss := q.Select(false, hints, matchers...)
+	ss := q.Select(ctx, false, hints, matchers...)
 	if ss.Err() != nil {
 		return 0, 0, ss.Err()
 	}
@@ -1716,7 +1783,7 @@ func (i *Ingester) executeChunksQuery(ctx context.Context, db *userTSDB, from, t
 	if i.limits.OutOfOrderTimeWindow(db.userID) > 0 {
 		q, err = db.UnorderedChunkQuerier(ctx, from, through)
 	} else {
-		q, err = db.ChunkQuerier(ctx, from, through)
+		q, err = db.ChunkQuerier(from, through)
 	}
 	if err != nil {
 		return 0, 0, err
@@ -1730,7 +1797,7 @@ func (i *Ingester) executeChunksQuery(ctx context.Context, db *userTSDB, from, t
 	hints = configSelectHintsWithDisabledTrimming(hints)
 
 	// It's not required to return sorted series because series are sorted by the Mimir querier.
-	ss := q.Select(false, hints, matchers...)
+	ss := q.Select(ctx, false, hints, matchers...)
 	if ss.Err() != nil {
 		return 0, 0, ss.Err()
 	}
@@ -1810,7 +1877,7 @@ func (i *Ingester) executeStreamingQuery(ctx context.Context, db *userTSDB, from
 	if i.limits.OutOfOrderTimeWindow(db.userID) > 0 {
 		q, err = db.UnorderedChunkQuerier(ctx, from, through)
 	} else {
-		q, err = db.ChunkQuerier(ctx, from, through)
+		q, err = db.ChunkQuerier(from, through)
 	}
 	if err != nil {
 		return 0, 0, err
@@ -1819,7 +1886,7 @@ func (i *Ingester) executeStreamingQuery(ctx context.Context, db *userTSDB, from
 	// The querier must remain open until we've finished streaming chunks.
 	defer q.Close()
 
-	allSeries, numSeries, err := i.sendStreamingQuerySeries(q, from, through, matchers, shard, stream)
+	allSeries, numSeries, err := i.sendStreamingQuerySeries(ctx, q, from, through, matchers, shard, stream)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1869,7 +1936,7 @@ func putChunkSeriesNode(sn *chunkSeriesNode) {
 	chunkSeriesNodePool.Put(sn)
 }
 
-func (i *Ingester) sendStreamingQuerySeries(q storage.ChunkQuerier, from, through int64, matchers []*labels.Matcher, shard *sharding.ShardSelector, stream client.Ingester_QueryStreamServer) (*chunkSeriesNode, int, error) {
+func (i *Ingester) sendStreamingQuerySeries(ctx context.Context, q storage.ChunkQuerier, from, through int64, matchers []*labels.Matcher, shard *sharding.ShardSelector, stream client.Ingester_QueryStreamServer) (*chunkSeriesNode, int, error) {
 	// Disable chunks trimming, so that we don't have to rewrite chunks which have samples outside
 	// the requested from/through range. PromQL engine can handle it.
 	hints := initSelectHints(from, through)
@@ -1877,7 +1944,7 @@ func (i *Ingester) sendStreamingQuerySeries(q storage.ChunkQuerier, from, throug
 	hints = configSelectHintsWithDisabledTrimming(hints)
 
 	// Series must be sorted so that they can be read by the querier in the order the PromQL engine expects.
-	ss := q.Select(true, hints, matchers...)
+	ss := q.Select(ctx, true, hints, matchers...)
 	if ss.Err() != nil {
 		return nil, 0, ss.Err()
 	}
@@ -2117,34 +2184,36 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
 	// Create a new user database
 	db, err := tsdb.Open(udir, userLogger, tsdbPromReg, &tsdb.Options{
-		RetentionDuration:                  i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
-		MinBlockDuration:                   blockRanges[0],
-		MaxBlockDuration:                   blockRanges[len(blockRanges)-1],
-		NoLockfile:                         true,
-		StripeSize:                         i.cfg.BlocksStorageConfig.TSDB.StripeSize,
-		HeadChunksWriteBufferSize:          i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteBufferSize,
-		HeadChunksEndTimeVariance:          i.cfg.BlocksStorageConfig.TSDB.HeadChunksEndTimeVariance,
-		WALCompression:                     i.cfg.BlocksStorageConfig.TSDB.WALCompressionType(),
-		WALSegmentSize:                     i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
-		WALReplayConcurrency:               walReplayConcurrency,
-		SeriesLifecycleCallback:            userDB,
-		BlocksToDelete:                     userDB.blocksToDelete,
-		EnableExemplarStorage:              true, // enable for everyone so we can raise the limit later
-		MaxExemplars:                       int64(maxExemplars),
-		SeriesHashCache:                    i.seriesHashCache,
-		EnableMemorySnapshotOnShutdown:     i.cfg.BlocksStorageConfig.TSDB.MemorySnapshotOnShutdown,
-		IsolationDisabled:                  true,
-		HeadChunksWriteQueueSize:           i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteQueueSize,
-		AllowOverlappingCompaction:         false,                // always false since Mimir only uploads lvl 1 compacted blocks
-		OutOfOrderTimeWindow:               oooTW.Milliseconds(), // The unit must be same as our timestamps.
-		OutOfOrderCapMax:                   int64(i.cfg.BlocksStorageConfig.TSDB.OutOfOrderCapacityMax),
-		HeadPostingsForMatchersCacheTTL:    i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheTTL,
-		HeadPostingsForMatchersCacheSize:   i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheSize,
-		HeadPostingsForMatchersCacheForce:  i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheForce,
-		BlockPostingsForMatchersCacheTTL:   i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheTTL,
-		BlockPostingsForMatchersCacheSize:  i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheSize,
-		BlockPostingsForMatchersCacheForce: i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheForce,
-		EnableNativeHistograms:             i.limits.NativeHistogramsIngestionEnabled(userID),
+		RetentionDuration:                     i.cfg.BlocksStorageConfig.TSDB.Retention.Milliseconds(),
+		MinBlockDuration:                      blockRanges[0],
+		MaxBlockDuration:                      blockRanges[len(blockRanges)-1],
+		NoLockfile:                            true,
+		StripeSize:                            i.cfg.BlocksStorageConfig.TSDB.StripeSize,
+		HeadChunksWriteBufferSize:             i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteBufferSize,
+		HeadChunksEndTimeVariance:             i.cfg.BlocksStorageConfig.TSDB.HeadChunksEndTimeVariance,
+		WALCompression:                        i.cfg.BlocksStorageConfig.TSDB.WALCompressionType(),
+		WALSegmentSize:                        i.cfg.BlocksStorageConfig.TSDB.WALSegmentSizeBytes,
+		WALReplayConcurrency:                  walReplayConcurrency,
+		SeriesLifecycleCallback:               userDB,
+		BlocksToDelete:                        userDB.blocksToDelete,
+		EnableExemplarStorage:                 true, // enable for everyone so we can raise the limit later
+		MaxExemplars:                          int64(maxExemplars),
+		SeriesHashCache:                       i.seriesHashCache,
+		EnableMemorySnapshotOnShutdown:        i.cfg.BlocksStorageConfig.TSDB.MemorySnapshotOnShutdown,
+		IsolationDisabled:                     true,
+		HeadChunksWriteQueueSize:              i.cfg.BlocksStorageConfig.TSDB.HeadChunksWriteQueueSize,
+		AllowOverlappingCompaction:            false,                // always false since Mimir only uploads lvl 1 compacted blocks
+		OutOfOrderTimeWindow:                  oooTW.Milliseconds(), // The unit must be same as our timestamps.
+		OutOfOrderCapMax:                      int64(i.cfg.BlocksStorageConfig.TSDB.OutOfOrderCapacityMax),
+		HeadPostingsForMatchersCacheTTL:       i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheTTL,
+		HeadPostingsForMatchersCacheMaxItems:  i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheMaxItems,
+		HeadPostingsForMatchersCacheMaxBytes:  i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheMaxBytes,
+		HeadPostingsForMatchersCacheForce:     i.cfg.BlocksStorageConfig.TSDB.HeadPostingsForMatchersCacheForce,
+		BlockPostingsForMatchersCacheTTL:      i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheTTL,
+		BlockPostingsForMatchersCacheMaxItems: i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheMaxItems,
+		BlockPostingsForMatchersCacheMaxBytes: i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheMaxBytes,
+		BlockPostingsForMatchersCacheForce:    i.cfg.BlocksStorageConfig.TSDB.BlockPostingsForMatchersCacheForce,
+		EnableNativeHistograms:                i.limits.NativeHistogramsIngestionEnabled(userID),
 	}, nil)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
@@ -2155,7 +2224,9 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 	// this will actually create the blocks. If there is no data (empty TSDB), this is a no-op, although
 	// local blocks compaction may still take place if configured.
 	level.Info(userLogger).Log("msg", "Running compaction after WAL replay")
-	err = db.Compact()
+	// Note that we want to let TSDB creation finish without being interrupted by eventual context cancellation,
+	// so passing an independent context here
+	err = db.Compact(context.Background())
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
 	}
@@ -2313,7 +2384,7 @@ func (i *Ingester) openExistingTSDB(ctx context.Context) error {
 }
 
 func getOpenTSDBsConcurrencyConfig(tsdbConfig mimir_tsdb.TSDBConfig, userCount int) (tsdbOpenConcurrency, tsdbWALReplayConcurrency int) {
-	tsdbOpenConcurrency = tsdbConfig.DeprecatedMaxTSDBOpeningConcurrencyOnStartup
+	tsdbOpenConcurrency = mimir_tsdb.DefaultMaxTSDBOpeningConcurrencyOnStartup
 	tsdbWALReplayConcurrency = 0
 	// When WALReplayConcurrency is enabled, we want to ensure the WAL replay at ingester startup
 	// doesn't use more than the configured number of CPU cores. In order to optimize performance
@@ -2394,6 +2465,38 @@ func (i *Ingester) getOldestUnshippedBlockMetric() float64 {
 	}
 
 	return float64(oldest / 1000)
+}
+
+func (i *Ingester) minTsdbHeadTimestamp() float64 {
+	i.tsdbsMtx.RLock()
+	defer i.tsdbsMtx.RUnlock()
+
+	minTime := int64(math.MaxInt64)
+	for _, db := range i.tsdbs {
+		minTime = util_math.Min(minTime, db.db.Head().MinTime())
+	}
+
+	if minTime == math.MaxInt64 {
+		return 0
+	}
+	// convert to seconds
+	return float64(minTime) / 1000
+}
+
+func (i *Ingester) maxTsdbHeadTimestamp() float64 {
+	i.tsdbsMtx.RLock()
+	defer i.tsdbsMtx.RUnlock()
+
+	maxTime := int64(math.MinInt64)
+	for _, db := range i.tsdbs {
+		maxTime = util_math.Max(maxTime, db.db.Head().MaxTime())
+	}
+
+	if maxTime == math.MinInt64 {
+		return 0
+	}
+	// convert to seconds
+	return float64(maxTime) / 1000
 }
 
 func (i *Ingester) shipBlocksLoop(ctx context.Context) error {
@@ -2679,8 +2782,15 @@ func filterUsersToCompactToReduceInMemorySeries(numMemorySeries, earlyCompaction
 
 	// Compact all TSDBs blocks required to get the number of in-memory series below the threshold and, in addition,
 	// all TSDBs where the estimated series reduction is greater than the minimum reduction percentage.
-	slices.SortFunc(estimations, func(a, b seriesReductionEstimation) bool {
-		return a.estimatedCount > b.estimatedCount
+	slices.SortFunc(estimations, func(a, b seriesReductionEstimation) int {
+		switch {
+		case b.estimatedCount < a.estimatedCount:
+			return -1
+		case b.estimatedCount > a.estimatedCount:
+			return 1
+		default:
+			return 0
+		}
 	})
 
 	for _, entry := range estimations {
@@ -2897,57 +3007,6 @@ func (i *Ingester) FlushHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func newIngestErrSample(errID globalerror.ID, errMsg string, timestamp model.Time, labels []mimirpb.LabelAdapter) error {
-	return fmt.Errorf("%v. The affected sample has timestamp %s and is from series %s", errID.Message(errMsg), timestamp.Time().UTC().Format(time.RFC3339Nano), mimirpb.FromLabelAdaptersToLabels(labels).String())
-}
-
-func newIngestErrSampleTimestampTooOld(timestamp model.Time, labels []mimirpb.LabelAdapter) error {
-	return newIngestErrSample(globalerror.SampleTimestampTooOld, "the sample has been rejected because its timestamp is too old", timestamp, labels)
-}
-
-func newIngestErrSampleTimestampTooOldOOOEnabled(timestamp model.Time, labels []mimirpb.LabelAdapter, oooTimeWindow time.Duration) error {
-	return newIngestErrSample(globalerror.SampleTimestampTooOld, fmt.Sprintf("the sample has been rejected because another sample with a more recent timestamp has already been ingested and this sample is beyond the out-of-order time window of %s", model.Duration(oooTimeWindow).String()), timestamp, labels)
-}
-
-func newIngestErrSampleTimestampTooFarInFuture(timestamp model.Time, labels []mimirpb.LabelAdapter) error {
-	return newIngestErrSample(globalerror.SampleTooFarInFuture, "received a sample whose timestamp is too far in the future", timestamp, labels)
-}
-
-func newIngestErrSampleOutOfOrder(timestamp model.Time, labels []mimirpb.LabelAdapter) error {
-	return newIngestErrSample(globalerror.SampleOutOfOrder, "the sample has been rejected because another sample with a more recent timestamp has already been ingested and out-of-order samples are not allowed", timestamp, labels)
-}
-
-func newIngestErrSampleDuplicateTimestamp(timestamp model.Time, labels []mimirpb.LabelAdapter) error {
-	return newIngestErrSample(globalerror.SampleDuplicateTimestamp, "the sample has been rejected because another sample with the same timestamp, but a different value, has already been ingested", timestamp, labels)
-}
-
-func newIngestErrExemplar(errID globalerror.ID, errMsg string, timestamp model.Time, seriesLabels, exemplarLabels []mimirpb.LabelAdapter) error {
-	return fmt.Errorf("%v. The affected exemplar is %s with timestamp %s for series %s",
-		errID.Message(errMsg),
-		mimirpb.FromLabelAdaptersToLabels(exemplarLabels).String(),
-		timestamp.Time().UTC().Format(time.RFC3339Nano),
-		mimirpb.FromLabelAdaptersToLabels(seriesLabels).String())
-}
-
-func newIngestErrExemplarMissingSeries(timestamp model.Time, seriesLabels, exemplarLabels []mimirpb.LabelAdapter) error {
-	return newIngestErrExemplar(globalerror.ExemplarSeriesMissing, "the exemplar has been rejected because the related series has not been ingested yet", timestamp, seriesLabels, exemplarLabels)
-}
-
-func newIngestErrExemplarTimestampTooFarInFuture(timestamp model.Time, seriesLabels, exemplarLabels []mimirpb.LabelAdapter) error {
-	return newIngestErrExemplar(globalerror.ExemplarTooFarInFuture, "received an exemplar whose timestamp is too far in the future", timestamp, seriesLabels, exemplarLabels)
-}
-
-func wrappedTSDBIngestExemplarOtherErr(ingestErr error, timestamp model.Time, seriesLabels, exemplarLabels []mimirpb.LabelAdapter) error {
-	if ingestErr == nil {
-		return nil
-	}
-
-	return fmt.Errorf("err: %v. timestamp=%s, series=%s, exemplar=%s", ingestErr, timestamp.Time().UTC().Format(time.RFC3339Nano),
-		mimirpb.FromLabelAdaptersToLabels(seriesLabels).String(),
-		mimirpb.FromLabelAdaptersToLabels(exemplarLabels).String(),
-	)
-}
-
 func (i *Ingester) getInstanceLimits() *InstanceLimits {
 	// Don't apply any limits while starting. We especially don't want to apply series in memory limit while replaying WAL.
 	if i.State() == services.Starting {
@@ -3060,6 +3119,21 @@ func (i *Ingester) ShutdownHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// checkAvailable checks whether the ingester is available, and if it is not the case
+// returns an unavailableError error.
+// Using block store, the ingester is available only when it is in a Running state.
+// The ingester is not available when stopping to prevent any read or writes to the
+// TSDB after the ingester has closed them.
+func (i *Ingester) checkAvailable() error {
+	s := i.State()
+	if s == services.Running {
+		return nil
+	}
+	return newUnavailableError(s)
+}
+
+// TODO checkRunning should be removed once the error handling improvement is completed.
+// TODO return gRPC errors only at the topmost level.
 // Using block store, the ingester is only available when it is in a Running state. The ingester is not available
 // when stopping to prevent any read or writes to the TSDB after the ingester has closed them.
 func (i *Ingester) checkRunning() error {
@@ -3072,11 +3146,29 @@ func (i *Ingester) checkRunning() error {
 
 // Push implements client.IngesterServer
 func (i *Ingester) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
-	pushReq := push.NewParsedRequest(req)
-	pushReq.AddCleanup(func() {
-		mimirpb.ReuseSlice(req.Timeseries)
-	})
-	return i.PushWithCleanup(ctx, pushReq)
+	err := i.PushWithCleanup(ctx, req, func() { mimirpb.ReuseSlice(req.Timeseries) })
+	if err == nil {
+		return &mimirpb.WriteResponse{}, nil
+	}
+	handledErr := handlePushError(err)
+	return nil, handledErr
+}
+
+func handlePushError(err error) error {
+	var ingesterErr ingesterError
+	if errors.As(err, &ingesterErr) {
+		switch ingesterErr.errorType() {
+		case badData:
+			return newErrorWithHTTPStatus(err, http.StatusBadRequest)
+		case unavailable:
+			return newErrorWithStatus(err, codes.Unavailable)
+		case instanceLimitReached:
+			return newErrorWithStatus(util_log.DoNotLogError{Err: err}, codes.Unavailable)
+		case tsdbUnavailable:
+			return newErrorWithHTTPStatus(err, http.StatusServiceUnavailable)
+		}
+	}
+	return err
 }
 
 // pushMetadata returns number of ingested metadata.
@@ -3127,7 +3219,7 @@ func (i *Ingester) getOrCreateUserMetadata(userID string) *userMetricsMetadata {
 	// Ensure it was not created between switching locks.
 	userMetadata, ok := i.usersMetadata[userID]
 	if !ok {
-		userMetadata = newMetadataMap(i.limiter, i.metrics, userID)
+		userMetadata = newMetadataMap(i.limiter, i.metrics, i.errorSamplers, userID)
 		i.usersMetadata[userID] = userMetadata
 	}
 	return userMetadata
@@ -3178,7 +3270,7 @@ func (i *Ingester) purgeUserMetricsMetadata() {
 }
 
 // MetricsMetadata returns all the metrics metadata of a user.
-func (i *Ingester) MetricsMetadata(ctx context.Context, _ *client.MetricsMetadataRequest) (*client.MetricsMetadataResponse, error) {
+func (i *Ingester) MetricsMetadata(ctx context.Context, req *client.MetricsMetadataRequest) (*client.MetricsMetadataResponse, error) {
 	if err := i.checkRunning(); err != nil {
 		return nil, err
 	}
@@ -3194,7 +3286,7 @@ func (i *Ingester) MetricsMetadata(ctx context.Context, _ *client.MetricsMetadat
 		return &client.MetricsMetadataResponse{}, nil
 	}
 
-	return &client.MetricsMetadataResponse{Metadata: userMetadata.toClientMetadata()}, nil
+	return &client.MetricsMetadataResponse{Metadata: userMetadata.toClientMetadata(req)}, nil
 }
 
 // CheckReady is the readiness handler used to indicate to k8s when the ingesters

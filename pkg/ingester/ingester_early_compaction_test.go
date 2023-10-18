@@ -634,8 +634,14 @@ func TestIngester_compactBlocksToReduceInMemorySeries_Concurrency(t *testing.T) 
 			res, err := client.StreamsToMatrix(model.Earliest, model.Latest, s.responses)
 			require.NoError(t, err)
 
-			slices.SortFunc(res, func(a, b *model.SampleStream) bool {
-				return a.Metric.Before(b.Metric)
+			slices.SortFunc(res, func(a, b *model.SampleStream) int {
+				if a.Metric.Before(b.Metric) {
+					return -1
+				}
+				if a.Metric.Equal(b.Metric) {
+					return 0
+				}
+				return 1
 			})
 
 			require.Len(t, res, numSeries)
@@ -675,8 +681,8 @@ func listBlocksInDir(t *testing.T, dir string) (ids []ulid.ULID) {
 	}
 
 	// Ensure the block IDs are sorted.
-	slices.SortFunc(ids, func(a, b ulid.ULID) bool {
-		return a.Compare(b) < 0
+	slices.SortFunc(ids, func(a, b ulid.ULID) int {
+		return a.Compare(b)
 	})
 
 	return ids
@@ -705,7 +711,9 @@ func readMetricSamplesFromBlock(t *testing.T, block *tsdb.Block, metricName stri
 		require.NoError(t, chunksReader.Close())
 	}()
 
-	postings, err := indexReader.Postings(labels.MetricName, metricName)
+	ctx := context.Background()
+
+	postings, err := indexReader.Postings(ctx, labels.MetricName, metricName)
 	require.NoError(t, err)
 
 	for postings.Next() {

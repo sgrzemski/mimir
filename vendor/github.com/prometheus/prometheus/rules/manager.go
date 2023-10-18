@@ -20,6 +20,7 @@ import (
 	"math"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -506,9 +507,11 @@ func (g *Group) AlertingRules() []*AlertingRule {
 			alerts = append(alerts, alertingRule)
 		}
 	}
-	slices.SortFunc(alerts, func(a, b *AlertingRule) bool {
-		return a.State() > b.State() ||
-			(a.State() == b.State() && a.Name() < b.Name())
+	slices.SortFunc(alerts, func(a, b *AlertingRule) int {
+		if a.State() == b.State() {
+			return strings.Compare(a.Name(), b.Name())
+		}
+		return int(b.State() - a.State())
 	})
 	return alerts
 }
@@ -669,6 +672,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 		}
 
 		func(i int, rule Rule) {
+			logger := log.WithPrefix(g.logger, "name", rule.Name(), "index", i)
 			ctx, sp := otel.Tracer("").Start(ctx, "rule")
 			sp.SetAttributes(attribute.String("name", rule.Name()))
 			defer func(t time.Time) {
@@ -679,6 +683,10 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				rule.SetEvaluationDuration(since)
 				rule.SetEvaluationTimestamp(t)
 			}(time.Now())
+
+			if sp.SpanContext().IsSampled() && sp.SpanContext().HasTraceID() {
+				logger = log.WithPrefix(g.logger, "traceID", sp.SpanContext().TraceID())
+			}
 
 			g.metrics.EvalTotal.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
 
@@ -693,7 +701,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				// happens on shutdown and thus we skip logging of any errors here.
 				var eqc promql.ErrQueryCanceled
 				if !errors.As(err, &eqc) {
-					level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Evaluating rule failed", "rule", rule, "err", err)
+					level.Warn(logger).Log("msg", "Evaluating rule failed", "rule", rule, "err", err)
 				}
 				return
 			}
@@ -719,7 +727,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 					sp.SetStatus(codes.Error, err.Error())
 					g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
 
-					level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule sample appending failed", "err", err)
+					level.Warn(logger).Log("msg", "Rule sample appending failed", "err", err)
 					return
 				}
 				g.seriesInPreviousEval[i] = seriesReturned
@@ -743,15 +751,15 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 					switch {
 					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample):
 						numOutOfOrder++
-						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
+						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					case errors.Is(unwrappedErr, storage.ErrTooOldSample):
 						numTooOld++
-						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
+						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					case errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
 						numDuplicates++
-						level.Debug(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
+						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					default:
-						level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Rule evaluation result discarded", "err", err, "sample", s)
+						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
 					}
 				} else {
 					buf := [1024]byte{}
@@ -759,13 +767,13 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				}
 			}
 			if numOutOfOrder > 0 {
-				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting out-of-order result from rule evaluation", "numDropped", numOutOfOrder)
+				level.Warn(logger).Log("msg", "Error on ingesting out-of-order result from rule evaluation", "numDropped", numOutOfOrder)
 			}
 			if numTooOld > 0 {
-				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting too old result from rule evaluation", "numDropped", numTooOld)
+				level.Warn(logger).Log("msg", "Error on ingesting too old result from rule evaluation", "numDropped", numTooOld)
 			}
 			if numDuplicates > 0 {
-				level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Error on ingesting results from rule evaluation with different value but same timestamp", "numDropped", numDuplicates)
+				level.Warn(logger).Log("msg", "Error on ingesting results from rule evaluation with different value but same timestamp", "numDropped", numDuplicates)
 			}
 
 			for metric, lset := range g.seriesInPreviousEval[i] {
@@ -784,7 +792,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 						// Do not count these in logging, as this is expected if series
 						// is exposed from a different rule.
 					default:
-						level.Warn(g.logger).Log("name", rule.Name(), "index", i, "msg", "Adding stale sample failed", "sample", lset.String(), "err", err)
+						level.Warn(logger).Log("msg", "Adding stale sample failed", "sample", lset.String(), "err", err)
 					}
 				}
 			}
@@ -844,7 +852,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 	// We allow restoration only if alerts were active before after certain time.
 	mint := ts.Add(-g.opts.OutageTolerance)
 	mintMS := int64(model.TimeFromUnixNano(mint.UnixNano()))
-	q, err := g.opts.Queryable.Querier(g.opts.Context, mintMS, maxtMS)
+	q, err := g.opts.Queryable.Querier(mintMS, maxtMS)
 	if err != nil {
 		level.Error(g.logger).Log("msg", "Failed to get Querier", "err", err)
 		return
@@ -873,7 +881,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 		alertRule.ForEachActiveAlert(func(a *Alert) {
 			var s storage.Series
 
-			s, err := alertRule.QueryforStateSeries(a, q)
+			s, err := alertRule.QueryforStateSeries(g.opts.Context, a, q)
 			if err != nil {
 				// Querier Warnings are ignored. We do not care unless we have an error.
 				level.Error(g.logger).Log(
@@ -1277,11 +1285,15 @@ func (m *Manager) RuleGroups() []*Group {
 		rgs = append(rgs, g)
 	}
 
-	slices.SortFunc(rgs, func(a, b *Group) bool {
-		if a.file != b.file {
-			return a.file < b.file
+	slices.SortFunc(rgs, func(a, b *Group) int {
+		fileCompare := strings.Compare(a.file, b.file)
+
+		// If its 0, then the file names are the same.
+		// Lets look at the group names in that case.
+		if fileCompare != 0 {
+			return fileCompare
 		}
-		return a.name < b.name
+		return strings.Compare(a.name, b.name)
 	})
 
 	return rgs

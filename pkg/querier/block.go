@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/storage/series"
@@ -61,7 +62,7 @@ func (bqss *blockQuerierSeriesSet) Next() bool {
 		return false
 	}
 
-	currLabels := mimirpb.FromLabelAdaptersToLabels(bqss.series[bqss.next].Labels)
+	currLabels := bqss.series[bqss.next].Labels
 	currChunks := bqss.series[bqss.next].Chunks
 
 	bqss.next++
@@ -69,12 +70,12 @@ func (bqss *blockQuerierSeriesSet) Next() bool {
 	// Merge chunks for current series. Chunks may come in multiple responses, but as soon
 	// as the response has chunks for a new series, we can stop searching. Series are sorted.
 	// See documentation for StoreClient.Series call for details.
-	for bqss.next < len(bqss.series) && labels.Compare(currLabels, mimirpb.FromLabelAdaptersToLabels(bqss.series[bqss.next].Labels)) == 0 {
+	for bqss.next < len(bqss.series) && mimirpb.CompareLabelAdapters(currLabels, bqss.series[bqss.next].Labels) == 0 {
 		currChunks = append(currChunks, bqss.series[bqss.next].Chunks...)
 		bqss.next++
 	}
 
-	bqss.currSeries = newBlockQuerierSeries(currLabels, currChunks)
+	bqss.currSeries = newBlockQuerierSeries(mimirpb.FromLabelAdaptersToLabels(currLabels), currChunks)
 	return true
 }
 
@@ -86,7 +87,7 @@ func (bqss *blockQuerierSeriesSet) Err() error {
 	return nil
 }
 
-func (bqss *blockQuerierSeriesSet) Warnings() storage.Warnings {
+func (bqss *blockQuerierSeriesSet) Warnings() annotations.Annotations {
 	return nil
 }
 

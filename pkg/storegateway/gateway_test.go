@@ -52,6 +52,7 @@ import (
 	mimir_testutil "github.com/grafana/mimir/pkg/storage/tsdb/testutil"
 	"github.com/grafana/mimir/pkg/storegateway/storepb"
 	"github.com/grafana/mimir/pkg/util"
+	"github.com/grafana/mimir/pkg/util/limiter"
 	"github.com/grafana/mimir/pkg/util/test"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
@@ -504,7 +505,7 @@ func TestStoreGateway_BlocksSyncWithDefaultSharding_RingTopologyChangedAfterScal
 				srv := newStoreGatewayTestServer(t, g)
 
 				req := &storepb.SeriesRequest{MinTime: math.MinInt64, MaxTime: math.MaxInt64}
-				_, _, hints, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+				_, _, hints, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 				require.NoError(t, err)
 
 				for _, b := range hints.QueriedBlocks {
@@ -790,7 +791,7 @@ func TestStoreGateway_SyncShouldKeepPreviousBlocksIfInstanceIsUnhealthyInTheRing
 
 		// Run query and ensure the block is queried.
 		req := &storepb.SeriesRequest{MinTime: math.MinInt64, MaxTime: math.MaxInt64}
-		_, _, hints, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+		_, _, hints, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 		require.NoError(t, err)
 		assert.Len(t, hints.QueriedBlocks, 1)
 
@@ -834,7 +835,7 @@ func TestStoreGateway_SyncShouldKeepPreviousBlocksIfInstanceIsUnhealthyInTheRing
 
 		// Run query and ensure the block is queried.
 		req := &storepb.SeriesRequest{MinTime: math.MinInt64, MaxTime: math.MaxInt64}
-		_, _, hints, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+		_, _, hints, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 		require.NoError(t, err)
 		assert.Len(t, hints.QueriedBlocks, 1)
 
@@ -871,7 +872,7 @@ func TestStoreGateway_SyncShouldKeepPreviousBlocksIfInstanceIsUnhealthyInTheRing
 
 		// Run query and ensure the block is queried.
 		req := &storepb.SeriesRequest{MinTime: math.MinInt64, MaxTime: math.MaxInt64}
-		_, _, hints, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+		_, _, hints, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 		require.NoError(t, err)
 		assert.Len(t, hints.QueriedBlocks, 1)
 
@@ -907,7 +908,7 @@ func TestStoreGateway_SyncShouldKeepPreviousBlocksIfInstanceIsUnhealthyInTheRing
 
 		// Run query and ensure the block is queried.
 		req := &storepb.SeriesRequest{MinTime: math.MinInt64, MaxTime: math.MaxInt64}
-		_, _, hints, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+		_, _, hints, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 		require.NoError(t, err)
 		assert.Len(t, hints.QueriedBlocks, 1)
 
@@ -1075,7 +1076,7 @@ func TestStoreGateway_SeriesQueryingShouldRemoveExternalLabels(t *testing.T) {
 						},
 						StreamingChunksBatchSize: uint64(streamingBatchSize),
 					}
-					seriesSet, warnings, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+					seriesSet, warnings, _, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 					require.NoError(t, err)
 					assert.Empty(t, warnings)
 					assert.Len(t, seriesSet, numSeries)
@@ -1188,7 +1189,7 @@ func TestStoreGateway_Series_QuerySharding(t *testing.T) {
 						StreamingChunksBatchSize: uint64(streamingBatchSize),
 					}
 
-					seriesSet, warnings, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+					seriesSet, warnings, _, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 					require.NoError(t, err)
 					assert.Empty(t, warnings)
 
@@ -1275,7 +1276,7 @@ func TestStoreGateway_Series_QueryShardingShouldGuaranteeSeriesShardingConsisten
 					StreamingChunksBatchSize: uint64(streamingBatchSize),
 				}
 
-				seriesSet, warnings, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+				seriesSet, warnings, _, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 				require.NoError(t, err)
 				assert.Empty(t, warnings)
 				require.Greater(t, len(seriesSet), 0)
@@ -1366,7 +1367,7 @@ func TestStoreGateway_Series_QueryShardingConcurrency(t *testing.T) {
 						StreamingChunksBatchSize: uint64(streamingBatchSize),
 					}
 
-					seriesSet, warnings, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+					seriesSet, warnings, _, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 					require.NoError(t, err)
 					assert.Empty(t, warnings)
 
@@ -1424,7 +1425,7 @@ func TestStoreGateway_SeriesQueryingShouldEnforceMaxChunksPerQueryLimit(t *testi
 		},
 		"should return error if the actual number of queried chunks is > limit": {
 			limit:       chunksQueried - 1,
-			expectedErr: status.Error(http.StatusUnprocessableEntity, fmt.Sprintf("exceeded chunks limit: rpc error: code = Code(422) desc = limit %d exceeded", chunksQueried-1)),
+			expectedErr: status.Error(http.StatusUnprocessableEntity, "rpc error: code = Code(422) desc = "+fmt.Sprintf(limiter.MaxChunksPerQueryLimitMsgFormat, chunksQueried-1)),
 		},
 	}
 
@@ -1479,7 +1480,7 @@ func TestStoreGateway_SeriesQueryingShouldEnforceMaxChunksPerQueryLimit(t *testi
 
 					// Query back all the series (1 chunk per series in this test).
 					req.StreamingChunksBatchSize = uint64(streamingBatchSize)
-					seriesSet, warnings, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
+					seriesSet, warnings, _, _, err := srv.Series(setUserIDToGRPCContext(ctx, userID), req)
 
 					if testData.expectedErr != nil {
 						require.Error(t, err)
@@ -1488,7 +1489,7 @@ func TestStoreGateway_SeriesQueryingShouldEnforceMaxChunksPerQueryLimit(t *testi
 						assert.True(t, ok)
 						s2, ok := status.FromError(errors.Cause(testData.expectedErr))
 						assert.True(t, ok)
-						assert.True(t, strings.Contains(s1.Message(), s2.Message()))
+						assert.Contains(t, s1.Message(), s2.Message())
 						assert.Equal(t, s1.Code(), s2.Code())
 					} else {
 						require.NoError(t, err)
@@ -1535,6 +1536,8 @@ func mockTSDB(t *testing.T, dir string, numSeries, numBlocks int, minT, maxT int
 	// will be then snapshotted to the input dir.
 	tempDir := t.TempDir()
 
+	ctx := context.Background()
+
 	db, err := tsdb.Open(tempDir, nil, nil, &tsdb.Options{
 		MinBlockDuration:  2 * time.Hour.Milliseconds(),
 		MaxBlockDuration:  2 * time.Hour.Milliseconds(),
@@ -1548,11 +1551,11 @@ func mockTSDB(t *testing.T, dir string, numSeries, numBlocks int, minT, maxT int
 	addSample := func(i int) {
 		lbls := labels.FromStrings("series_id", strconv.Itoa(i))
 
-		app := db.Appender(context.Background())
+		app := db.Appender(ctx)
 		_, err := app.Append(0, lbls, minT+(step*int64(i)), float64(i))
 		require.NoError(t, err)
 		require.NoError(t, app.Commit())
-		require.NoError(t, db.Compact())
+		require.NoError(t, db.Compact(ctx))
 	}
 	if numBlocks > 0 {
 		i := 0
@@ -1577,6 +1580,8 @@ func mockTSDBWithGenerator(t *testing.T, dir string, next func() (bool, labels.L
 	// will be then snapshotted to the input dir.
 	tempDir := t.TempDir()
 
+	ctx := context.Background()
+
 	db, err := tsdb.Open(tempDir, nil, nil, &tsdb.Options{
 		MinBlockDuration:  2 * time.Hour.Milliseconds(),
 		MaxBlockDuration:  2 * time.Hour.Milliseconds(),
@@ -1596,7 +1601,7 @@ func mockTSDBWithGenerator(t *testing.T, dir string, next func() (bool, labels.L
 		_, err := app.Append(0, lbls, timestamp, value)
 		require.NoError(t, err)
 		require.NoError(t, app.Commit())
-		require.NoError(t, db.Compact())
+		require.NoError(t, db.Compact(ctx))
 	}
 
 	require.NoError(t, db.Snapshot(dir, true))

@@ -25,7 +25,7 @@ import (
 	"github.com/grafana/mimir/pkg/util/atomicfs"
 )
 
-var lazyLoadedHeadersListFileName = "lazy-loaded.json"
+const lazyLoadedHeadersListFileName = "lazy-loaded.json"
 
 // ReaderPoolMetrics holds metrics tracked by ReaderPool.
 type ReaderPoolMetrics struct {
@@ -67,9 +67,8 @@ type ReaderPool struct {
 // LazyLoadedHeadersSnapshotConfig stores information needed to track lazy loaded index headers.
 type LazyLoadedHeadersSnapshotConfig struct {
 	// Path stores where lazy loaded blocks will be tracked in a single file per tenant
-	Path                string
-	UserID              string
-	EagerLoadingEnabled bool
+	Path   string
+	UserID string
 }
 
 type lazyLoadedHeadersSnapshot struct {
@@ -95,24 +94,13 @@ func (l lazyLoadedHeadersSnapshot) persist(persistDir string) error {
 }
 
 // NewReaderPool makes a new ReaderPool. If lazy-loading is enabled, NewReaderPool also starts a background task for unloading idle Readers and persisting a list of loaded Readers to disk.
-func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTimeout time.Duration, sparsePersistenceEnabled bool, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics, lazyLoadedSnapshotConfig LazyLoadedHeadersSnapshotConfig) *ReaderPool {
+func NewReaderPool(logger log.Logger, indexHeaderConfig Config, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics, lazyLoadedSnapshotConfig LazyLoadedHeadersSnapshotConfig) *ReaderPool {
 	var snapshot *lazyLoadedHeadersSnapshot
-	if lazyReaderEnabled && lazyLoadedSnapshotConfig.EagerLoadingEnabled {
-		lazyLoadedSnapshotFileName := filepath.Join(lazyLoadedSnapshotConfig.Path, lazyLoadedHeadersListFileName)
-		var err error
-		snapshot, err = loadLazyLoadedHeadersSnapshot(lazyLoadedSnapshotFileName)
-		if err != nil {
-			level.Warn(logger).Log("msg", "loading the list of index-headers from snapshot file failed; not eagerly loading index-headers for tenant", "file", lazyLoadedSnapshotFileName, "err", err, "tenant", lazyLoadedSnapshotConfig.UserID)
-		}
-		// We will remove the file regardless whether err is nil or not nil.
-		// In the case such as snapshot loading causing OOM, we will still
-		// remove the snapshot and lazy load after server is restarted.
-		if err := os.Remove(lazyLoadedSnapshotFileName); err != nil {
-			level.Warn(logger).Log("msg", "removing the lazy-loaded index-header snapshot failed", "file", lazyLoadedSnapshotFileName, "err", err)
-		}
+	if indexHeaderConfig.LazyLoadingEnabled && indexHeaderConfig.EagerLoadingStartupEnabled {
+		snapshot = tryRestoreLazyLoadedHeadersSnapshot(logger, lazyLoadedSnapshotConfig)
 	}
 
-	p := newReaderPool(logger, lazyReaderEnabled, lazyReaderIdleTimeout, sparsePersistenceEnabled, lazyLoadingGate, metrics, snapshot)
+	p := newReaderPool(logger, indexHeaderConfig, lazyLoadingGate, metrics, snapshot)
 
 	// Start a goroutine to close idle readers (only if required).
 	if p.lazyReaderEnabled && p.lazyReaderIdleTimeout > 0 {
@@ -124,7 +112,7 @@ func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTime
 
 			var lazyLoadC <-chan time.Time
 
-			if lazyLoadedSnapshotConfig.EagerLoadingEnabled {
+			if indexHeaderConfig.EagerLoadingStartupEnabled {
 				tickerLazyLoadPersist := time.NewTicker(time.Minute)
 				defer tickerLazyLoadPersist.Stop()
 
@@ -155,14 +143,40 @@ func NewReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTime
 	return p
 }
 
+func tryRestoreLazyLoadedHeadersSnapshot(logger log.Logger, cfg LazyLoadedHeadersSnapshotConfig) *lazyLoadedHeadersSnapshot {
+	fileName := filepath.Join(cfg.Path, lazyLoadedHeadersListFileName)
+	snapshot, err := loadLazyLoadedHeadersSnapshot(fileName)
+	if os.IsNotExist(err) {
+		// We didn't find the snapshot. Could be because we crashed after restoring it last time
+		// or because the previous binary didn't support eager loading.
+		// Either way, we can continue without eagerly loading blocks.
+		// Since the file wasn't found, we also won't try to remove it.
+		return nil
+	}
+	if err != nil {
+		level.Warn(logger).Log(
+			"msg", "loading the list of index-headers from snapshot file failed; not eagerly loading index-headers for tenant",
+			"file", fileName,
+			"err", err,
+		)
+	}
+	// We will remove the file regardless whether err is nil or not nil.
+	// In the case such as snapshot loading causing OOM, we will still
+	// remove the snapshot and lazy load after server is restarted.
+	if err := os.Remove(fileName); err != nil {
+		level.Warn(logger).Log("msg", "removing the lazy-loaded index-header snapshot failed", "file", fileName, "err", err)
+	}
+	return snapshot
+}
+
 // newReaderPool makes a new ReaderPool.
-func newReaderPool(logger log.Logger, lazyReaderEnabled bool, lazyReaderIdleTimeout time.Duration, sparsePersistenceEnabled bool, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics, lazyLoadedHeadersSnapshot *lazyLoadedHeadersSnapshot) *ReaderPool {
+func newReaderPool(logger log.Logger, indexHeaderConfig Config, lazyLoadingGate gate.Gate, metrics *ReaderPoolMetrics, lazyLoadedHeadersSnapshot *lazyLoadedHeadersSnapshot) *ReaderPool {
 	return &ReaderPool{
 		logger:                   logger,
 		metrics:                  metrics,
-		lazyReaderEnabled:        lazyReaderEnabled,
-		lazyReaderIdleTimeout:    lazyReaderIdleTimeout,
-		sparsePersistenceEnabled: sparsePersistenceEnabled,
+		lazyReaderEnabled:        indexHeaderConfig.LazyLoadingEnabled,
+		lazyReaderIdleTimeout:    indexHeaderConfig.LazyLoadingIdleTimeout,
+		sparsePersistenceEnabled: indexHeaderConfig.SparsePersistenceEnabled,
 		lazyReaders:              make(map[*LazyBinaryReader]struct{}),
 		close:                    make(chan struct{}),
 		preShutdownLoadedBlocks:  lazyLoadedHeadersSnapshot,

@@ -23,6 +23,7 @@ import (
 
 	"github.com/grafana/mimir/pkg/ingester/activeseries"
 	"github.com/grafana/mimir/pkg/util/extract"
+	"github.com/grafana/mimir/pkg/util/globalerror"
 	util_math "github.com/grafana/mimir/pkg/util/math"
 )
 
@@ -75,10 +76,10 @@ func (r tsdbCloseCheckResult) shouldClose() bool {
 }
 
 var (
-	errTSDBForcedCompaction = errors.New("TSDB Head forced compaction in progress and no write request is currently allowed")
-	errTSDBEarlyCompaction  = errors.New("TSDB Head early compaction in progress and the write request contains samples overlapping with it")
-	errTSDBClosing          = errors.New("TSDB is closing")
-	errTSDBNotActive        = errors.New("TSDB is not active")
+	errTSDBForcedCompaction = newTSDBUnavailableError("TSDB Head forced compaction in progress and no write request is currently allowed")
+	errTSDBEarlyCompaction  = newTSDBUnavailableError("TSDB Head early compaction in progress and the write request contains samples overlapping with it")
+	errTSDBClosing          = newTSDBUnavailableError("TSDB is closing")
+	errTSDBNotActive        = newTSDBUnavailableError("TSDB is not active")
 )
 
 type userTSDB struct {
@@ -128,12 +129,12 @@ func (u *userTSDB) Appender(ctx context.Context) storage.Appender {
 }
 
 // Querier returns a new querier over the data partition for the given time range.
-func (u *userTSDB) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-	return u.db.Querier(ctx, mint, maxt)
+func (u *userTSDB) Querier(mint, maxt int64) (storage.Querier, error) {
+	return u.db.Querier(mint, maxt)
 }
 
-func (u *userTSDB) ChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
-	return u.db.ChunkQuerier(ctx, mint, maxt)
+func (u *userTSDB) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	return u.db.ChunkQuerier(mint, maxt)
 }
 
 func (u *userTSDB) UnorderedChunkQuerier(ctx context.Context, mint, maxt int64) (storage.ChunkQuerier, error) {
@@ -157,7 +158,7 @@ func (u *userTSDB) Close() error {
 }
 
 func (u *userTSDB) Compact() error {
-	return u.db.Compact()
+	return u.db.Compact(context.Background())
 }
 
 func (u *userTSDB) StartTime() (int64, error) {
@@ -227,7 +228,7 @@ func (u *userTSDB) compactHead(blockDuration, forcedCompactionMaxTime int64) err
 		}
 	}
 
-	return u.db.CompactOOOHead()
+	return u.db.CompactOOOHead(context.Background())
 }
 
 // nextForcedHeadCompactionRange computes the next TSDB head range to compact when a forced compaction
@@ -273,8 +274,8 @@ func (u *userTSDB) PreCreation(metric labels.Labels) error {
 	}
 
 	// Total series limit.
-	if err := u.limiter.AssertMaxSeriesPerUser(u.userID, int(u.Head().NumSeries())); err != nil {
-		return err
+	if !u.limiter.IsWithinMaxSeriesPerUser(u.userID, int(u.Head().NumSeries())) {
+		return globalerror.MaxSeriesPerUser
 	}
 
 	// Series per metric name limit.
@@ -282,8 +283,8 @@ func (u *userTSDB) PreCreation(metric labels.Labels) error {
 	if err != nil {
 		return err
 	}
-	if err := u.seriesInMetric.canAddSeriesFor(u.userID, metricName); err != nil {
-		return err
+	if !u.seriesInMetric.canAddSeriesFor(u.userID, metricName) {
+		return globalerror.MaxSeriesPerMetric
 	}
 
 	return nil

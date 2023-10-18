@@ -136,8 +136,15 @@ func (p *PreallocTimeseries) SortLabelsIfNeeded() {
 		return
 	}
 
-	slices.SortFunc(p.Labels, func(a, b LabelAdapter) bool {
-		return a.Name < b.Name
+	slices.SortFunc(p.Labels, func(a, b LabelAdapter) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 	p.clearUnmarshalData()
 }
@@ -162,9 +169,13 @@ func (p *PreallocTimeseries) clearUnmarshalData() {
 	p.marshalledData = nil
 }
 
+var TimeseriesUnmarshalCachingEnabled = true
+
 // Unmarshal implements proto.Message. Input data slice is retained.
 func (p *PreallocTimeseries) Unmarshal(dAtA []byte) error {
-	p.marshalledData = dAtA
+	if TimeseriesUnmarshalCachingEnabled {
+		p.marshalledData = dAtA
+	}
 	p.TimeSeries = TimeseriesFromPool()
 	return p.TimeSeries.Unmarshal(dAtA)
 }

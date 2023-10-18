@@ -31,6 +31,7 @@ const (
 	MaxChunksPerQuery             ID = "max-chunks-per-query"
 	MaxSeriesPerQuery             ID = "max-series-per-query"
 	MaxChunkBytesPerQuery         ID = "max-chunks-bytes-per-query"
+	MaxEstimatedChunksPerQuery    ID = "max-estimated-chunks-per-query"
 
 	DistributorMaxIngestionRate             ID = "distributor-max-ingestion-rate"
 	DistributorMaxInflightPushRequests      ID = "distributor-max-inflight-push-requests"
@@ -56,6 +57,7 @@ const (
 	RequestRateLimited          ID = "tenant-max-request-rate"
 	IngestionRateLimited        ID = "tenant-max-ingestion-rate"
 	TooManyHAClusters           ID = "tenant-too-many-ha-clusters"
+	QueryBlocked                ID = "query-blocked"
 
 	SampleTimestampTooOld    ID = "sample-timestamp-too-old"
 	SampleOutOfOrder         ID = "sample-out-of-order"

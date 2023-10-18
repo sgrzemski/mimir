@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/gogo/status"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/instrument"
 	"github.com/grafana/dskit/kv"
@@ -47,7 +48,6 @@ import (
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	util_math "github.com/grafana/mimir/pkg/util/math"
 	"github.com/grafana/mimir/pkg/util/pool"
-	"github.com/grafana/mimir/pkg/util/push"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
@@ -77,9 +77,6 @@ const (
 	// Size of "slab" when using pooled buffers for marshaling write requests. When handling single Push request
 	// buffers for multiple write requests sent to ingesters will be allocated from single "slab", if there is enough space.
 	writeRequestSlabPoolSize = 512 * 1024
-
-	// 529 is non-standard status code used by some services to signal that "The service is overloaded".
-	statusServiceOverload = 529
 )
 
 // Distributor forwards appends and queries to individual ingesters.
@@ -143,11 +140,11 @@ type Distributor struct {
 	// Metrics for data rejected for hitting per-instance limits
 	rejectedRequests *prometheus.CounterVec
 
-	sampleValidationMetrics   *validation.SampleValidationMetrics
-	exemplarValidationMetrics *validation.ExemplarValidationMetrics
-	metadataValidationMetrics *validation.MetadataValidationMetrics
+	sampleValidationMetrics   *sampleValidationMetrics
+	exemplarValidationMetrics *exemplarValidationMetrics
+	metadataValidationMetrics *metadataValidationMetrics
 
-	PushWithMiddlewares push.Func
+	PushWithMiddlewares PushFunc
 
 	// Pool of []byte used when marshalling write requests.
 	writeRequestBytePool sync.Pool
@@ -188,10 +185,12 @@ type Config struct {
 	// and access the deserialized write requests before/after they are pushed.
 	// These functions will only receive samples that don't get dropped by HA deduplication.
 	PushWrappers []PushWrapper `yaml:"-"`
+
+	WriteRequestsBufferPoolingEnabled bool `yaml:"write_requests_buffer_pooling_enabled" category:"experimental"`
 }
 
 // PushWrapper wraps around a push. It is similar to middleware.Interface.
-type PushWrapper func(next push.Func) push.Func
+type PushWrapper func(next PushFunc) PushFunc
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
@@ -201,6 +200,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
 
 	f.IntVar(&cfg.MaxRecvMsgSize, "distributor.max-recv-msg-size", 100<<20, "Max message size in bytes that the distributors will accept for incoming push requests to the remote write API. If exceeded, the request will be rejected.")
 	f.DurationVar(&cfg.RemoteTimeout, "distributor.remote-timeout", 2*time.Second, "Timeout for downstream ingesters.")
+	f.BoolVar(&cfg.WriteRequestsBufferPoolingEnabled, "distributor.write-requests-buffer-pooling-enabled", false, "Enable pooling of buffers used for marshaling write requests.")
 
 	cfg.DefaultLimits.RegisterFlags(f)
 }
@@ -224,9 +224,9 @@ const (
 func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Overrides, activeGroupsCleanupService *util.ActiveGroupsCleanupService, ingestersRing ring.ReadRing, canJoinDistributorsRing bool, reg prometheus.Registerer, log log.Logger) (*Distributor, error) {
 	clientMetrics := ingester_client.NewMetrics(reg)
 	if cfg.IngesterClientFactory == nil {
-		cfg.IngesterClientFactory = func(addr string) (ring_client.PoolClient, error) {
-			return ingester_client.MakeIngesterClient(addr, clientConfig, clientMetrics)
-		}
+		cfg.IngesterClientFactory = ring_client.PoolInstFunc(func(inst ring.InstanceDesc) (ring_client.PoolClient, error) {
+			return ingester_client.MakeIngesterClient(inst, clientConfig, clientMetrics, log)
+		})
 	}
 
 	cfg.PoolConfig.RemoteTimeout = cfg.RemoteTimeout
@@ -326,20 +326,20 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Help: "Unix timestamp of latest received sample per user.",
 		}, []string{"user"}),
 
-		discardedSamplesTooManyHaClusters: validation.DiscardedSamplesCounter(reg, validation.ReasonTooManyHAClusters),
-		discardedSamplesRateLimited:       validation.DiscardedSamplesCounter(reg, validation.ReasonRateLimited),
-		discardedRequestsRateLimited:      validation.DiscardedRequestsCounter(reg, validation.ReasonRateLimited),
-		discardedExemplarsRateLimited:     validation.DiscardedExemplarsCounter(reg, validation.ReasonRateLimited),
-		discardedMetadataRateLimited:      validation.DiscardedMetadataCounter(reg, validation.ReasonRateLimited),
+		discardedSamplesTooManyHaClusters: validation.DiscardedSamplesCounter(reg, reasonTooManyHAClusters),
+		discardedSamplesRateLimited:       validation.DiscardedSamplesCounter(reg, reasonRateLimited),
+		discardedRequestsRateLimited:      validation.DiscardedRequestsCounter(reg, reasonRateLimited),
+		discardedExemplarsRateLimited:     validation.DiscardedExemplarsCounter(reg, reasonRateLimited),
+		discardedMetadataRateLimited:      validation.DiscardedMetadataCounter(reg, reasonRateLimited),
 
 		rejectedRequests: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
 			Name: "cortex_distributor_instance_rejected_requests_total",
 			Help: "Requests discarded for hitting per-instance limits",
 		}, []string{"reason"}),
 
-		sampleValidationMetrics:   validation.NewSampleValidationMetrics(reg),
-		exemplarValidationMetrics: validation.NewExemplarValidationMetrics(reg),
-		metadataValidationMetrics: validation.NewMetadataValidationMetrics(reg),
+		sampleValidationMetrics:   newSampleValidationMetrics(reg),
+		exemplarValidationMetrics: newExemplarValidationMetrics(reg),
+		metadataValidationMetrics: newMetadataValidationMetrics(reg),
 	}
 
 	// Initialize expected rejected request labels
@@ -527,16 +527,16 @@ func (d *Distributor) cleanupInactiveUser(userID string) {
 	d.discardedExemplarsRateLimited.DeleteLabelValues(userID)
 	d.discardedMetadataRateLimited.DeleteLabelValues(userID)
 
-	d.sampleValidationMetrics.DeleteUserMetrics(userID)
-	d.exemplarValidationMetrics.DeleteUserMetrics(userID)
-	d.metadataValidationMetrics.DeleteUserMetrics(userID)
+	d.sampleValidationMetrics.deleteUserMetrics(userID)
+	d.exemplarValidationMetrics.deleteUserMetrics(userID)
+	d.metadataValidationMetrics.deleteUserMetrics(userID)
 }
 
 func (d *Distributor) RemoveGroupMetricsForUser(userID, group string) {
 	d.dedupedSamples.DeleteLabelValues(userID, group)
 	d.discardedSamplesTooManyHaClusters.DeleteLabelValues(userID, group)
 	d.discardedSamplesRateLimited.DeleteLabelValues(userID, group)
-	d.sampleValidationMetrics.DeleteUserMetricsForGroup(userID, group)
+	d.sampleValidationMetrics.deleteUserMetricsForGroup(userID, group)
 }
 
 // Called after distributor is asked to stop via StopAsync.
@@ -607,7 +607,7 @@ func (d *Distributor) checkSample(ctx context.Context, userID, cluster, replica 
 // The returned error may retain the series labels.
 // It uses the passed nowt time to observe the delay of sample timestamps.
 func (d *Distributor) validateSeries(nowt time.Time, ts *mimirpb.PreallocTimeseries, userID, group string, skipLabelNameValidation bool, minExemplarTS, maxExemplarTS int64) error {
-	if err := validation.ValidateLabels(d.sampleValidationMetrics, d.limits, userID, group, ts.Labels, skipLabelNameValidation); err != nil {
+	if err := validateLabels(d.sampleValidationMetrics, d.limits, userID, group, ts.Labels, skipLabelNameValidation); err != nil {
 		return err
 	}
 
@@ -620,7 +620,7 @@ func (d *Distributor) validateSeries(nowt time.Time, ts *mimirpb.PreallocTimeser
 			d.sampleDelayHistogram.Observe(float64(delta) / 1000)
 		}
 
-		if err := validation.ValidateSample(d.sampleValidationMetrics, now, d.limits, userID, group, ts.Labels, s); err != nil {
+		if err := validateSample(d.sampleValidationMetrics, now, d.limits, userID, group, ts.Labels, s); err != nil {
 			return err
 		}
 	}
@@ -631,7 +631,7 @@ func (d *Distributor) validateSeries(nowt time.Time, ts *mimirpb.PreallocTimeser
 			d.sampleDelayHistogram.Observe(float64(delta) / 1000)
 		}
 
-		if err := validation.ValidateSampleHistogram(d.sampleValidationMetrics, now, d.limits, userID, group, ts.Labels, h); err != nil {
+		if err := validateSampleHistogram(d.sampleValidationMetrics, now, d.limits, userID, group, ts.Labels, h); err != nil {
 			return err
 		}
 	}
@@ -643,14 +643,14 @@ func (d *Distributor) validateSeries(nowt time.Time, ts *mimirpb.PreallocTimeser
 
 	for i := 0; i < len(ts.Exemplars); {
 		e := ts.Exemplars[i]
-		if err := validation.ValidateExemplar(d.exemplarValidationMetrics, userID, ts.Labels, e); err != nil {
+		if err := validateExemplar(d.exemplarValidationMetrics, userID, ts.Labels, e); err != nil {
 			// An exemplar validation error prevents ingesting samples
 			// in the same series object. However because the current Prometheus
 			// remote write implementation only populates one or the other,
 			// there never will be any.
 			return err
 		}
-		if !validation.ValidateExemplarTimestamp(d.exemplarValidationMetrics, userID, minExemplarTS, maxExemplarTS, e) {
+		if !validateExemplarTimestamp(d.exemplarValidationMetrics, userID, minExemplarTS, maxExemplarTS, e) {
 			ts.DeleteExemplarByMovingLast(i)
 			// Don't increase index i. After moving last exemplar to this index, we want to check it again.
 			continue
@@ -662,7 +662,7 @@ func (d *Distributor) validateSeries(nowt time.Time, ts *mimirpb.PreallocTimeser
 
 // wrapPushWithMiddlewares returns push function wrapped in all Distributor's middlewares.
 // push wrappers will be applied to incoming requests in the order in which they are in the slice in the config struct.
-func (d *Distributor) wrapPushWithMiddlewares(next push.Func) push.Func {
+func (d *Distributor) wrapPushWithMiddlewares(next PushFunc) PushFunc {
 	var middlewares []PushWrapper
 
 	// The middlewares will be applied to the request (!) in the specified order, from first to last.
@@ -682,8 +682,8 @@ func (d *Distributor) wrapPushWithMiddlewares(next push.Func) push.Func {
 	return next
 }
 
-func (d *Distributor) prePushHaDedupeMiddleware(next push.Func) push.Func {
-	return func(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) prePushHaDedupeMiddleware(next PushFunc) PushFunc {
+	return func(ctx context.Context, pushReq *Request) error {
 		cleanupInDefer := true
 		defer func() {
 			if cleanupInDefer {
@@ -693,12 +693,12 @@ func (d *Distributor) prePushHaDedupeMiddleware(next push.Func) push.Func {
 
 		req, err := pushReq.WriteRequest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		userID, err := tenant.TenantID(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if len(req.Timeseries) == 0 || !d.limits.AcceptHASamples(userID) {
@@ -725,18 +725,16 @@ func (d *Distributor) prePushHaDedupeMiddleware(next push.Func) push.Func {
 
 		removeReplica, err := d.checkSample(ctx, userID, cluster, replica)
 		if err != nil {
-			if errors.Is(err, replicasNotMatchError{}) {
+			if errors.As(err, &replicasDidNotMatchError{}) {
 				// These samples have been deduped.
 				d.dedupedSamples.WithLabelValues(userID, cluster).Add(float64(numSamples))
-				return nil, httpgrpc.Errorf(http.StatusAccepted, err.Error())
 			}
 
-			if errors.Is(err, tooManyClustersError{}) {
+			if errors.As(err, &tooManyClustersError{}) {
 				d.discardedSamplesTooManyHaClusters.WithLabelValues(userID, group).Add(float64(numSamples))
-				return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 			}
 
-			return nil, err
+			return err
 		}
 
 		if removeReplica {
@@ -756,8 +754,8 @@ func (d *Distributor) prePushHaDedupeMiddleware(next push.Func) push.Func {
 	}
 }
 
-func (d *Distributor) prePushRelabelMiddleware(next push.Func) push.Func {
-	return func(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) prePushRelabelMiddleware(next PushFunc) PushFunc {
+	return func(ctx context.Context, pushReq *Request) error {
 		cleanupInDefer := true
 		defer func() {
 			if cleanupInDefer {
@@ -767,12 +765,12 @@ func (d *Distributor) prePushRelabelMiddleware(next push.Func) push.Func {
 
 		req, err := pushReq.WriteRequest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		userID, err := tenant.TenantID(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		var removeTsIndexes []int
@@ -825,8 +823,8 @@ func (d *Distributor) prePushRelabelMiddleware(next push.Func) push.Func {
 	}
 }
 
-func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
-	return func(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) prePushValidationMiddleware(next PushFunc) PushFunc {
+	return func(ctx context.Context, pushReq *Request) error {
 		cleanupInDefer := true
 		defer func() {
 			if cleanupInDefer {
@@ -836,12 +834,12 @@ func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
 
 		req, err := pushReq.WriteRequest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		userID, err := tenant.TenantID(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		now := mtime.Now()
@@ -901,9 +899,8 @@ func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
 			// invalid data but all the remaining series could be perfectly valid.
 			if validationErr != nil {
 				if firstPartialErr == nil {
-					// The series labels may be retained by validationErr but that's not a problem for this
-					// use case because we format it calling Error() and then we discard it.
-					firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, validationErr.Error())
+					// The series are never retained by validationErr. This is guaranteed by the way the latter is built.
+					firstPartialErr = newValidationError(validationErr)
 				}
 				removeIndexes = append(removeIndexes, tsIdx)
 				continue
@@ -921,11 +918,10 @@ func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
 		}
 
 		for mIdx, m := range req.Metadata {
-			if validationErr := validation.CleanAndValidateMetadata(d.metadataValidationMetrics, d.limits, userID, m); validationErr != nil {
+			if validationErr := cleanAndValidateMetadata(d.metadataValidationMetrics, d.limits, userID, m); validationErr != nil {
 				if firstPartialErr == nil {
-					// The metadata info may be retained by validationErr but that's not a problem for this
-					// use case because we format it calling Error() and then we discard it.
-					firstPartialErr = httpgrpc.Errorf(http.StatusBadRequest, validationErr.Error())
+					// The series are never retained by validationErr. This is guaranteed by the way the latter is built.
+					firstPartialErr = newValidationError(validationErr)
 				}
 
 				removeIndexes = append(removeIndexes, mIdx)
@@ -939,7 +935,7 @@ func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
 		}
 
 		if validatedSamples == 0 && validatedMetadata == 0 {
-			return &mimirpb.WriteResponse{}, firstPartialErr
+			return firstPartialErr
 		}
 
 		totalN := validatedSamples + validatedExemplars + validatedMetadata
@@ -947,30 +943,27 @@ func (d *Distributor) prePushValidationMiddleware(next push.Func) push.Func {
 			d.discardedSamplesRateLimited.WithLabelValues(userID, group).Add(float64(validatedSamples))
 			d.discardedExemplarsRateLimited.WithLabelValues(userID).Add(float64(validatedExemplars))
 			d.discardedMetadataRateLimited.WithLabelValues(userID).Add(float64(validatedMetadata))
-			// Return a 429 here to tell the client it is going too fast.
-			// Client may discard the data or slow down and re-send.
-			// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
-			return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.NewIngestionRateLimitedError(d.limits.IngestionRate(userID), d.limits.IngestionBurstSize(userID)).Error())
+			return newIngestionRateLimitedError(d.limits.IngestionRate(userID), d.limits.IngestionBurstSize(userID))
 		}
 
 		// totalN included samples, exemplars and metadata. Ingester follows this pattern when computing its ingestion rate.
 		d.ingestionRate.Add(int64(totalN))
 
 		cleanupInDefer = false
-		res, err := next(ctx, pushReq)
+		err = next(ctx, pushReq)
 		if err != nil {
 			// Errors resulting from the pushing to the ingesters have priority over validation errors.
-			return nil, err
+			return err
 		}
 
-		return res, firstPartialErr
+		return firstPartialErr
 	}
 }
 
 // metricsMiddleware updates metrics which are expected to account for all received data,
 // including data that later gets modified or dropped.
-func (d *Distributor) metricsMiddleware(next push.Func) push.Func {
-	return func(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) metricsMiddleware(next PushFunc) PushFunc {
+	return func(ctx context.Context, pushReq *Request) error {
 		cleanupInDefer := true
 		defer func() {
 			if cleanupInDefer {
@@ -980,12 +973,12 @@ func (d *Distributor) metricsMiddleware(next push.Func) push.Func {
 
 		req, err := pushReq.WriteRequest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		userID, err := tenant.TenantID(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		numSamples := 0
@@ -993,6 +986,13 @@ func (d *Distributor) metricsMiddleware(next push.Func) push.Func {
 		for _, ts := range req.Timeseries {
 			numSamples += len(ts.Samples) + len(ts.Histograms)
 			numExemplars += len(ts.Exemplars)
+		}
+
+		span := opentracing.SpanFromContext(ctx)
+		if span != nil {
+			span.SetTag("write.samples", numSamples)
+			span.SetTag("write.exemplars", numExemplars)
+			span.SetTag("write.metadata", len(req.Metadata))
 		}
 
 		d.incomingRequests.WithLabelValues(userID).Inc()
@@ -1006,8 +1006,8 @@ func (d *Distributor) metricsMiddleware(next push.Func) push.Func {
 }
 
 // limitsMiddleware checks for instance limits and rejects request if this instance cannot process it at the moment.
-func (d *Distributor) limitsMiddleware(next push.Func) push.Func {
-	return func(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) limitsMiddleware(next PushFunc) PushFunc {
+	return func(ctx context.Context, pushReq *Request) error {
 		// Increment number of requests and bytes before doing the checks, so that we hit error if this request crosses the limits.
 		inflight := d.inflightPushRequests.Inc()
 
@@ -1025,37 +1025,34 @@ func (d *Distributor) limitsMiddleware(next push.Func) push.Func {
 		il := d.getInstanceLimits()
 		if il.MaxInflightPushRequests > 0 && inflight > int64(il.MaxInflightPushRequests) {
 			d.rejectedRequests.WithLabelValues(reasonDistributorMaxInflightPushRequests).Inc()
-			return nil, util_log.DoNotLogError{Err: errMaxInflightRequestsReached}
+			return util_log.DoNotLogError{Err: errMaxInflightRequestsReached}
 		}
 
 		if il.MaxIngestionRate > 0 {
 			if rate := d.ingestionRate.Rate(); rate >= il.MaxIngestionRate {
 				d.rejectedRequests.WithLabelValues(reasonDistributorMaxIngestionRate).Inc()
-				return nil, errMaxIngestionRateReached
+				return errMaxIngestionRateReached
 			}
 		}
 
 		userID, err := tenant.TenantID(ctx)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		now := mtime.Now()
 		if !d.requestRateLimiter.AllowN(now, userID, 1) {
 			d.discardedRequestsRateLimited.WithLabelValues(userID).Add(1)
 
-			// Return a 429 or a 529 here depending on configuration to tell the client it is going too fast.
-			// Client may discard the data or slow down and re-send.
-			// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
-			if d.limits.ServiceOverloadStatusCodeOnRateLimitEnabled(userID) {
-				return nil, httpgrpc.Errorf(statusServiceOverload, validation.NewRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID)).Error())
-			}
-			return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.NewRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID)).Error())
+			return newRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID))
 		}
+
+		// Note that we don't enforce the per-user ingestion rate limit here since we need to apply validation
+		// before we know how many samples/exemplars/metadata we'll actually be writing.
 
 		req, err := pushReq.WriteRequest()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		reqSize := int64(req.Size())
 		inflightBytes := d.inflightPushRequestsBytes.Add(reqSize)
@@ -1065,7 +1062,7 @@ func (d *Distributor) limitsMiddleware(next push.Func) push.Func {
 
 		if il.MaxInflightPushRequestsBytes > 0 && inflightBytes > int64(il.MaxInflightPushRequestsBytes) {
 			d.rejectedRequests.WithLabelValues(reasonDistributorMaxInflightPushRequestsBytes).Inc()
-			return nil, errMaxInflightRequestsBytesReached
+			return errMaxInflightRequestsBytesReached
 		}
 
 		cleanupInDefer = false
@@ -1075,19 +1072,55 @@ func (d *Distributor) limitsMiddleware(next push.Func) push.Func {
 
 // Push is gRPC method registered as client.IngesterServer and distributor.DistributorServer.
 func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
-	pushReq := push.NewParsedRequest(req)
+	pushReq := NewParsedRequest(req)
 	pushReq.AddCleanup(func() {
 		mimirpb.ReuseSlice(req.Timeseries)
 	})
 
-	return d.PushWithMiddlewares(ctx, pushReq)
+	pushErr := d.PushWithMiddlewares(ctx, pushReq)
+	if pushErr == nil {
+		return &mimirpb.WriteResponse{}, nil
+	}
+	handledErr := d.handlePushError(ctx, pushErr)
+	return nil, handledErr
+}
+
+func (d *Distributor) handlePushError(ctx context.Context, pushErr error) error {
+	if errors.Is(pushErr, context.Canceled) {
+		return pushErr
+	}
+
+	if errors.Is(pushErr, context.DeadlineExceeded) {
+		return pushErr
+	}
+
+	// TODO This code is needed for backwards compatibility, since ingesters may still return
+	// errors created by httpgrpc.Errorf(). If pushErr is one of those errors, we just propagate
+	// it. This code should be removed once that creation is removed from the ingesters.
+	_, ok := httpgrpc.HTTPResponseFromError(pushErr)
+	if ok {
+		return pushErr
+	}
+	// If pushErr is already a gRPC (for example returned by the ingester), we just propagate it.
+	// TODO this should be updated once the ingester error handling is improved.
+	_, ok = status.FromError(pushErr)
+	if ok {
+		return pushErr
+	}
+
+	serviceOverloadErrorEnabled := false
+	userID, err := tenant.TenantID(ctx)
+	if err == nil {
+		serviceOverloadErrorEnabled = d.limits.ServiceOverloadStatusCodeOnRateLimitEnabled(userID)
+	}
+	return toGRPCError(pushErr, serviceOverloadErrorEnabled)
 }
 
 // push takes a write request and distributes it to ingesters using the ring.
 // Strings in pushReq may be pointers into the gRPC buffer which will be reused, so must be copied if retained.
 // push does not check limits like ingestion rate and inflight requests.
 // These limits are checked either by Push gRPC method (when invoked via gRPC) or limitsMiddleware (when invoked via HTTP)
-func (d *Distributor) push(ctx context.Context, pushReq *push.Request) (*mimirpb.WriteResponse, error) {
+func (d *Distributor) push(ctx context.Context, pushReq *Request) error {
 	cleanupInDefer := true
 	defer func() {
 		if cleanupInDefer {
@@ -1097,18 +1130,18 @@ func (d *Distributor) push(ctx context.Context, pushReq *push.Request) (*mimirpb
 
 	req, err := pushReq.WriteRequest()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	d.updateReceivedMetrics(req, userID)
 
 	if len(req.Timeseries) == 0 && len(req.Metadata) == 0 {
-		return &mimirpb.WriteResponse{}, nil
+		return nil
 	}
 
 	span := opentracing.SpanFromContext(ctx)
@@ -1146,8 +1179,10 @@ func (d *Distributor) push(ctx context.Context, pushReq *push.Request) (*mimirpb
 	// so set this flag false and pass cleanup() to DoBatch.
 	cleanupInDefer = false
 
-	slabPool := pool.NewFastReleasingSlabPool[byte](&d.writeRequestBytePool, writeRequestSlabPoolSize)
-	localCtx = ingester_client.WithSlabPool(localCtx, slabPool)
+	if d.cfg.WriteRequestsBufferPoolingEnabled {
+		slabPool := pool.NewFastReleasingSlabPool[byte](&d.writeRequestBytePool, writeRequestSlabPoolSize)
+		localCtx = ingester_client.WithSlabPool(localCtx, slabPool)
+	}
 
 	err = ring.DoBatch(ctx, ring.WriteNoExtend, subRing, keys, func(ingester ring.InstanceDesc, indexes []int) error {
 		var timeseriesCount, metadataCount int
@@ -1172,15 +1207,12 @@ func (d *Distributor) push(ctx context.Context, pushReq *push.Request) (*mimirpb
 
 		err := d.send(localCtx, ingester, timeseries, metadata, req.Source)
 		if errors.Is(err, context.DeadlineExceeded) {
-			return httpgrpc.Errorf(500, "exceeded configured distributor remote timeout: %s", err.Error())
+			return errors.Wrap(err, deadlineExceededWrapMessage)
 		}
 		return err
 	}, func() { pushReq.CleanUp(); cancel() })
 
-	if err != nil {
-		return nil, err
-	}
-	return &mimirpb.WriteResponse{}, nil
+	return err
 }
 
 func preallocSliceIfNeeded[T any](size int) []T {
@@ -1220,7 +1252,7 @@ func copyString(s string) string {
 }
 
 func (d *Distributor) send(ctx context.Context, ingester ring.InstanceDesc, timeseries []mimirpb.PreallocTimeseries, metadata []*mimirpb.MetricMetadata, source mimirpb.WriteRequest_SourceEnum) error {
-	h, err := d.ingesterPool.GetClientFor(ingester.Addr)
+	h, err := d.ingesterPool.GetClientForInstance(ingester)
 	if err != nil {
 		return err
 	}
@@ -1233,7 +1265,15 @@ func (d *Distributor) send(ctx context.Context, ingester ring.InstanceDesc, time
 	}
 
 	_, err = c.Push(ctx, &req)
-	if resp, ok := httpgrpc.HTTPResponseFromError(err); ok {
+	return handleIngesterPushError(err)
+}
+
+func handleIngesterPushError(err error) error {
+	if err == nil {
+		return nil
+	}
+	resp, ok := httpgrpc.HTTPResponseFromError(err)
+	if ok {
 		// Wrap HTTP gRPC error with more explanatory message.
 		return httpgrpc.Errorf(int(resp.Code), "failed pushing to ingester: %s", resp.Body)
 	}
@@ -1243,7 +1283,7 @@ func (d *Distributor) send(ctx context.Context, ingester ring.InstanceDesc, time
 // forReplicationSet runs f, in parallel, for all ingesters in the input replication set.
 func forReplicationSet[T any](ctx context.Context, d *Distributor, replicationSet ring.ReplicationSet, f func(context.Context, ingester_client.IngesterClient) (T, error)) ([]T, error) {
 	wrappedF := func(ctx context.Context, ing *ring.InstanceDesc) (T, error) {
-		client, err := d.ingesterPool.GetClientFor(ing.Addr)
+		client, err := d.ingesterPool.GetClientForInstance(*ing)
 		if err != nil {
 			var empty T
 			return empty, err
@@ -1281,7 +1321,7 @@ func (d *Distributor) LabelValuesForLabelName(ctx context.Context, from, to mode
 		return nil, err
 	}
 
-	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
+	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (*ingester_client.LabelValuesResponse, error) {
 		return client.LabelValues(ctx, req)
 	})
 	if err != nil {
@@ -1290,7 +1330,7 @@ func (d *Distributor) LabelValuesForLabelName(ctx context.Context, from, to mode
 
 	valueSet := map[string]struct{}{}
 	for _, resp := range resps {
-		for _, v := range resp.(*ingester_client.LabelValuesResponse).LabelValues {
+		for _, v := range resp.LabelValues {
 			valueSet[v] = struct{}{}
 		}
 	}
@@ -1323,7 +1363,7 @@ func (d *Distributor) LabelNamesAndValues(ctx context.Context, matchers []*label
 	}
 	sizeLimitBytes := d.limits.LabelNamesAndValuesResultsMaxSizeBytes(userID)
 	merger := &labelNamesAndValuesResponseMerger{result: map[string]map[string]struct{}{}, sizeLimitBytes: sizeLimitBytes}
-	_, err = forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
+	_, err = forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (ingester_client.Ingester_LabelNamesAndValuesClient, error) {
 		stream, err := client.LabelNamesAndValues(ctx, req)
 		if err != nil {
 			return nil, err
@@ -1474,7 +1514,7 @@ func (d *Distributor) labelValuesCardinality(ctx context.Context, labelNames []m
 	}
 
 	_, err = ring.DoUntilQuorum[struct{}](ctx, replicationSet, d.queryQuorumConfig(ctx), func(ctx context.Context, desc *ring.InstanceDesc) (struct{}, error) {
-		poolClient, err := d.ingesterPool.GetClientFor(desc.Addr)
+		poolClient, err := d.ingesterPool.GetClientForInstance(*desc)
 		if err != nil {
 			return struct{}{}, err
 		}
@@ -1643,7 +1683,7 @@ func (d *Distributor) LabelNames(ctx context.Context, from, to model.Time, match
 		return nil, err
 	}
 
-	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
+	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (*ingester_client.LabelNamesResponse, error) {
 		return client.LabelNames(ctx, req)
 	})
 	if err != nil {
@@ -1652,7 +1692,7 @@ func (d *Distributor) LabelNames(ctx context.Context, from, to model.Time, match
 
 	valueSet := map[string]struct{}{}
 	for _, resp := range resps {
-		for _, v := range resp.(*ingester_client.LabelNamesResponse).LabelNames {
+		for _, v := range resp.LabelNames {
 			valueSet[v] = struct{}{}
 		}
 	}
@@ -1679,7 +1719,7 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 		return nil, err
 	}
 
-	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
+	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (*ingester_client.MetricsForLabelMatchersResponse, error) {
 		return client.MetricsForLabelMatchers(ctx, req)
 	})
 	if err != nil {
@@ -1688,7 +1728,7 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 
 	metrics := map[uint64]labels.Labels{}
 	for _, resp := range resps {
-		ms := ingester_client.FromMetricsForLabelMatchersResponse(resp.(*ingester_client.MetricsForLabelMatchersResponse))
+		ms := ingester_client.FromMetricsForLabelMatchersResponse(resp)
 		for _, m := range ms {
 			metrics[labels.StableHash(m)] = m
 		}
@@ -1702,14 +1742,13 @@ func (d *Distributor) MetricsForLabelMatchers(ctx context.Context, from, through
 }
 
 // MetricsMetadata returns all metric metadata of a user.
-func (d *Distributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetadata, error) {
+func (d *Distributor) MetricsMetadata(ctx context.Context, req *ingester_client.MetricsMetadataRequest) ([]scrape.MetricMetadata, error) {
 	replicationSet, err := d.GetIngesters(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	req := &ingester_client.MetricsMetadataRequest{}
-	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (interface{}, error) {
+	resps, err := forReplicationSet(ctx, d, replicationSet, func(ctx context.Context, client ingester_client.IngesterClient) (*ingester_client.MetricsMetadataResponse, error) {
 		return client.MetricsMetadata(ctx, req)
 	})
 	if err != nil {
@@ -1718,8 +1757,7 @@ func (d *Distributor) MetricsMetadata(ctx context.Context) ([]scrape.MetricMetad
 
 	result := []scrape.MetricMetadata{}
 	dedupTracker := map[mimirpb.MetricMetadata]struct{}{}
-	for _, resp := range resps {
-		r := resp.(*ingester_client.MetricsMetadataResponse)
+	for _, r := range resps {
 		for _, m := range r.Metadata {
 			// Given we look across all ingesters - dedup the metadata.
 			_, ok := dedupTracker[*m]
@@ -1765,7 +1803,7 @@ func (d *Distributor) UserStats(ctx context.Context, countMethod cardinality.Cou
 		CountMethod: ingesterCountMethod,
 	}
 	resps, err := ring.DoUntilQuorum[zonedUserStatsResponse](ctx, replicationSet, d.queryQuorumConfig(ctx), func(ctx context.Context, desc *ring.InstanceDesc) (zonedUserStatsResponse, error) {
-		poolClient, err := d.ingesterPool.GetClientFor(desc.Addr)
+		poolClient, err := d.ingesterPool.GetClientForInstance(*desc)
 		if err != nil {
 			return zonedUserStatsResponse{}, err
 		}
@@ -1826,7 +1864,7 @@ func (d *Distributor) AllUserStats(ctx context.Context) ([]UserIDStats, error) {
 		return nil, err
 	}
 	for _, ingester := range replicationSet.Instances {
-		client, err := d.ingesterPool.GetClientFor(ingester.Addr)
+		client, err := d.ingesterPool.GetClientForInstance(ingester)
 		if err != nil {
 			return nil, err
 		}

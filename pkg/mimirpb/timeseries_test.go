@@ -200,6 +200,10 @@ func TestDeepCopyTimeseriesExemplars(t *testing.T) {
 }
 
 func TestPreallocTimeseries_Unmarshal(t *testing.T) {
+	defer func() {
+		TimeseriesUnmarshalCachingEnabled = true
+	}()
+
 	// Prepare message
 	msg := PreallocTimeseries{}
 	{
@@ -218,6 +222,14 @@ func TestPreallocTimeseries_Unmarshal(t *testing.T) {
 
 		data, err := src.Marshal()
 		require.NoError(t, err)
+
+		TimeseriesUnmarshalCachingEnabled = false
+
+		require.NoError(t, msg.Unmarshal(data))
+		require.True(t, src.Equal(msg.TimeSeries))
+		require.Nil(t, msg.marshalledData)
+
+		TimeseriesUnmarshalCachingEnabled = true
 
 		require.NoError(t, msg.Unmarshal(data))
 		require.True(t, src.Equal(msg.TimeSeries))
@@ -431,7 +443,16 @@ func BenchmarkPreallocTimeseries_SortLabelsIfNeeded(b *testing.B) {
 
 			b.Run("unordered", benchmarkSortLabelsIfNeeded(unorderedLabels))
 
-			slices.SortFunc(unorderedLabels, func(a, b LabelAdapter) bool { return a.Name < b.Name })
+			slices.SortFunc(unorderedLabels, func(a, b LabelAdapter) int {
+				switch {
+				case a.Name < b.Name:
+					return -1
+				case a.Name > b.Name:
+					return 1
+				default:
+					return 0
+				}
+			})
 			b.Run("ordered", benchmarkSortLabelsIfNeeded(unorderedLabels))
 		})
 	}

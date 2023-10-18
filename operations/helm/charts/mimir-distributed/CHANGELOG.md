@@ -11,7 +11,7 @@ remove a deprecated item from the third major release after it has been deprecat
   * __How to migrate__: replace usages of port 8080 with port 80; these usages can be in dashboards, Prometheus remote-write configurations, or automation for updating rules.
 * NGINX configuration via `nginx` top-level values sections is being merged with by the `gateway` section. The
   `nginx` section is deprecated in `4.0.0` and will be removed in `7.0.0`.
-  * __How to migrate__: refer to [Migrate to using the unified proxy deployment for NGINX and GEM gateway](https://grafana.com/docs/mimir/latest/operators-guide/deploying-grafana-mimir/migrate-to-unified-gateway-deployment/)
+  * __How to migrate__: refer to [Migrate to using the unified proxy deployment for NGINX and GEM gateway](https://grafana.com/docs/helm-charts/mimir-distributed/latest/migration-guides/migrate-to-unified-proxy-deployment/)
 
 ## Format of changelog
 
@@ -28,11 +28,26 @@ Entries should include a reference to the Pull Request that introduced the chang
 
 ## main / unreleased
 
+* [CHANGE] Reduce `-server.grpc-max-concurrent-streams` from 1000 to 500 for ingester and to 100 for all components. #5666
+* [CHANGE] Changed default `clusterDomain` from `cluster.local` to `cluster.local.` to reduce the number of DNS lookups made by Mimir. #6389
+* [ENHANCEMENT] Update the `rollout-operator` subchart to `0.9.1`. #6022 #6110
+* [BUGFIX] Let the unified gatway/nginx config listen on IPv6 as well. Followup to #5948. #6204
+
+## 5.1.1
+
+* [BUGFIX] Update Mimir image to 2.10.2 and GEM image to v2.10.2. #6371
+
+## 5.1.0
+
+* [ENHANCEMENT] Update Mimir image to 2.10.0 and GEM image to v2.10.1. #6077
+* [ENHANCEMENT] Make compactor podManagementPolicy configurable. #5902
 * [ENHANCEMENT] Distributor: dynamically set `GOMAXPROCS` based on the CPU request. This should reduce distributor CPU utilization, assuming the CPU request is set to a value close to the actual utilization. #5588
 * [ENHANCEMENT] Querier: dynamically set `GOMAXPROCS` based on the CPU request. This should reduce noisy neighbour issues created by the querier, whose CPU utilization could eventually saturate the Kubernetes node if unbounded. #5646
 * [ENHANCEMENT] Sets the `appProtocol` value to `tcp` for the `gossip-ring-svc` service template. This allows memberlist to work with istio protocol selection. #5673
 * [ENHANCEMENT] Update the `rollout-operator` subchart to `0.8.0`. #5718
 * [ENHANCEMENT] Make store_gateway podManagementPolicy configurable. #5757
+* [ENHANCEMENT] Set `maxUnavailable` to 0 for `distributor`, `overrides-exporter`, `querier`, `query-frontend`, `query-scheduler`, `ruler-querier`, `ruler-query-frontend`, `ruler-query-scheduler`, `nginx`, `gateway`, `admin-api`, `graphite-querier` and `graphite-write-proxy` deployments, to ensure they don't become completely unavailable during a rollout. #5924
+* [ENHANCEMENT] Nginx: listen on IPv6 addresses. #5948
 * [BUGFIX] Fix `global.podLabels` causing invalid indentation. #5625
 
 ## 5.0.0
@@ -138,7 +153,7 @@ Entries should include a reference to the Pull Request that introduced the chang
 ## 4.0.0
 
 * [FEATURE] Support deploying NGINX via the `gateway` section. The `nginx` section will be removed in `7.0.0`. See
-  [Migrate to using the unified proxy deployment for NGINX and GEM gateway](https://grafana.com/docs/mimir/latest/operators-guide/deploying-grafana-mimir/migrate-to-unified-gateway-deployment/)
+  [Migrate to using the unified proxy deployment for NGINX and GEM gateway](https://grafana.com/docs/helm-charts/mimir-distributed/latest/migration-guides/migrate-to-unified-proxy-deployment/)
 * [CHANGE] **breaking change** **Data loss without action.** Enables [zone-aware replication](https://grafana.com/docs/mimir/latest/configure/configure-zone-aware-replication/) for ingesters and store-gateways by default. #2778
   - If you are **upgrading** an existing installation:
     - Turn off zone-aware replication, by setting the following values:

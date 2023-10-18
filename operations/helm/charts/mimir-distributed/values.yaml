@@ -34,7 +34,7 @@ image:
   # -- Grafana Mimir container image repository. Note: for Grafana Enterprise Metrics use the value 'enterprise.image.repository'
   repository: grafana/mimir
   # -- Grafana Mimir container image tag. Note: for Grafana Enterprise Metrics use the value 'enterprise.image.tag'
-  tag: r251-aafefa6
+  tag: r259-80ee3c1
   # -- Container pull policy - shared between Grafana Mimir and Grafana Enterprise Metrics
   pullPolicy: IfNotPresent
   # -- Optionally specify an array of imagePullSecrets - shared between Grafana Mimir and Grafana Enterprise Metrics
@@ -47,7 +47,7 @@ global:
   # -- Definitions to set up nginx resolver
   dnsService: kube-dns
   dnsNamespace: kube-system
-  clusterDomain: cluster.local
+  clusterDomain: cluster.local.
 
   # -- Common environment variables to add to all pods directly managed by this chart.
   # scope: admin-api, alertmanager, compactor, distributor, gateway, ingester, memcached, nginx, overrides-exporter, querier, query-frontend, query-scheduler, ruler, store-gateway, smoke-test, tokengen
@@ -365,7 +365,6 @@ mimir:
       file: /var/{{ include "mimir.name" . }}/runtime.yaml
 
     server:
-      grpc_server_max_concurrent_streams: 1000
       grpc_server_max_connection_age: 2m
       grpc_server_max_connection_age_grace: 5m
       grpc_server_max_connection_idle: 1m
@@ -757,6 +756,9 @@ distributor:
 
   strategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   terminationGracePeriodSeconds: 60
 
@@ -988,6 +990,9 @@ overrides_exporter:
 
   strategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   podLabels: {}
   podAnnotations: {}
@@ -1181,6 +1186,9 @@ querier:
 
   strategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   terminationGracePeriodSeconds: 180
 
@@ -1252,6 +1260,9 @@ query_frontend:
 
   strategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   terminationGracePeriodSeconds: 180
 
@@ -1325,8 +1336,8 @@ query_scheduler:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 0
-      maxUnavailable: 1
+      maxUnavailable: 0
+      maxSurge: 1
 
   terminationGracePeriodSeconds: 180
 
@@ -1563,6 +1574,8 @@ compactor:
   podDisruptionBudget:
     maxUnavailable: 1
 
+  podManagementPolicy: OrderedReady
+
   # -- The name of the PriorityClass for compactor pods
   priorityClassName: null
 
@@ -1646,7 +1659,7 @@ memcached:
     # -- Memcached Docker image repository
     repository: memcached
     # -- Memcached Docker image tag
-    tag: 1.6.19-alpine
+    tag: 1.6.21-alpine
     # -- Memcached Docker image pull policy
     pullPolicy: IfNotPresent
 
@@ -1669,7 +1682,7 @@ memcachedExporter:
 
   image:
     repository: prom/memcached-exporter
-    tag: v0.11.2
+    tag: v0.13.0
     pullPolicy: IfNotPresent
 
   resources:
@@ -2134,13 +2147,16 @@ nginx:
   # ref: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
   deploymentStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
   image:
     # -- The Docker registry for nginx image
     registry: docker.io
     # -- The nginx image repository
     repository: nginxinc/nginx-unprivileged
     # -- The nginx image tag
-    tag: 1.24-alpine
+    tag: 1.25-alpine
     # -- The nginx image pull policy
     pullPolicy: IfNotPresent
   # -- The name of the PriorityClass for nginx pods
@@ -2347,6 +2363,7 @@ nginx:
         proxy_read_timeout 300;
         server {
           listen 8080;
+          listen [::]:8080;
 
           {{- if .Values.nginx.basicAuth.enabled }}
           auth_basic           "Mimir";
@@ -2454,9 +2471,9 @@ gateway:
   # ref: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy
   strategy:
     type: RollingUpdate
-    # rollingUpdate:
-    #   maxSurge: 25%
-    #   maxUnavailable: 25%
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   # -- The name of the PriorityClass
   priorityClassName: null
@@ -2604,7 +2621,7 @@ gateway:
       # -- The nginx image repository
       repository: nginxinc/nginx-unprivileged
       # -- The nginx image tag
-      tag: 1.24-alpine
+      tag: 1.25-alpine
 
     # -- Basic auth configuration
     basicAuth:
@@ -2692,6 +2709,7 @@ gateway:
           proxy_read_timeout 300;
           server {
             listen {{ include "mimir.serverHttpListenPort" . }};
+            listen [::]:{{ include "mimir.serverHttpListenPort" . }};
 
             {{- if .Values.gateway.nginx.basicAuth.enabled }}
             auth_basic           "Mimir";
@@ -3043,7 +3061,7 @@ enterprise:
     # -- Grafana Enterprise Metrics container image repository. Note: for Grafana Mimir use the value 'image.repository'
     repository: grafana/enterprise-metrics
     # -- Grafana Enterprise Metrics container image tag. Note: for Grafana Mimir use the value 'image.tag'
-    tag: r251-ff3c4c60
+    tag: r259-87dd7101
     # Note: pullPolicy and optional pullSecrets are set in toplevel 'image' section, not here
 
 # In order to use Grafana Enterprise Metrics features, you will need to provide the contents of your Grafana Enterprise Metrics
@@ -3092,6 +3110,9 @@ admin_api:
 
   strategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 15%
 
   podLabels: {}
   podAnnotations: {}
@@ -3299,6 +3320,9 @@ graphite:
 
     strategy:
       type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 15%
 
     terminationGracePeriodSeconds: 180
 
@@ -3375,6 +3399,9 @@ graphite:
 
     strategy:
       type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 15%
 
     # -- Grace period to allow the graphite-write-proxy to shutdown before it is killed
     terminationGracePeriodSeconds: 180
@@ -3519,7 +3546,7 @@ gr-metricname-cache:
 smoke_test:
   image:
     repository: grafana/mimir-continuous-test
-    tag: r251-aafefa6
+    tag: r259-80ee3c1
     pullPolicy: IfNotPresent
   tenantId: ''
   extraArgs: {}
@@ -3539,7 +3566,7 @@ continuous_test:
   replicas: 1
   image:
     repository: grafana/mimir-continuous-test
-    tag: r251-aafefa6
+    tag: r259-80ee3c1
     pullPolicy: IfNotPresent
     # Note: optional pullSecrets are set in toplevel 'image' section, not here
 
