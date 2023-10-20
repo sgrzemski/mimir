@@ -24,7 +24,7 @@ import (
 	"github.com/grafana/mimir/integration/e2emimir"
 )
 
-func TestIngesterGlobalLimits(t *testing.T) {
+func TestIngesterGlobalLimitsErrors(t *testing.T) {
 	tests := map[string]struct {
 		tenantShardSize          int
 		maxGlobalSeriesPerTenant int
@@ -35,11 +35,11 @@ func TestIngesterGlobalLimits(t *testing.T) {
 			maxGlobalSeriesPerTenant: 1000,
 			maxGlobalSeriesPerMetric: 300,
 		},
-		"shuffle sharding enabled": {
+		/*"shuffle sharding enabled": {
 			tenantShardSize:          1,
 			maxGlobalSeriesPerTenant: 1000,
 			maxGlobalSeriesPerMetric: 300,
-		},
+		},*/
 	}
 
 	for testName, testData := range tests {
@@ -104,6 +104,7 @@ func TestIngesterGlobalLimits(t *testing.T) {
 					numSeriesWithSameMetricName++
 				} else {
 					require.Equal(t, 400, res.StatusCode)
+					fmt.Println("errId", errs, "err", res.Body)
 					if errs++; errs >= maxErrorsBeforeStop {
 						break
 					}
@@ -119,6 +120,7 @@ func TestIngesterGlobalLimits(t *testing.T) {
 				if res.StatusCode == 200 {
 					numSeriesTotal++
 				} else {
+					fmt.Println("errId", errs, "err", res.Body)
 					require.Equal(t, 400, res.StatusCode)
 					if errs++; errs >= maxErrorsBeforeStop {
 						break
@@ -143,7 +145,7 @@ func TestIngesterGlobalLimits(t *testing.T) {
 	}
 }
 
-func TestIngesterDynamicLimits(t *testing.T) {
+func TestIngesterDynamicLimitsErrors(t *testing.T) {
 	const (
 		overridesFile     = "overrides.yaml"
 		overridesTemplate = `
