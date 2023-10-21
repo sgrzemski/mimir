@@ -107,17 +107,23 @@ func (c *Client) SetTimeout(t time.Duration) {
 
 // Push the input timeseries to the remote endpoint
 func (c *Client) Push(timeseries []prompb.TimeSeries) (*http.Response, error) {
+	res, _, err := c.PushWithBody(timeseries)
+	return res, err
+}
+
+// PushWithBody the input timeseries to the remote endpoint
+func (c *Client) PushWithBody(timeseries []prompb.TimeSeries) (*http.Response, []byte, error) {
 	// Create write request
 	data, err := proto.Marshal(&prompb.WriteRequest{Timeseries: timeseries})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Create HTTP request
 	compressed := snappy.Encode(nil, data)
 	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/v1/push", c.distributorAddress), bytes.NewReader(compressed))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	req.Header.Add("Content-Encoding", "snappy")
@@ -131,11 +137,15 @@ func (c *Client) Push(timeseries []prompb.TimeSeries) (*http.Response, error) {
 	// Execute HTTP request
 	res, err := c.httpClient.Do(req.WithContext(ctx))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	defer res.Body.Close()
-	return res, nil
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return res, body, nil
 }
 
 // PushOTLP the input timeseries to the remote endpoint in OTLP format
