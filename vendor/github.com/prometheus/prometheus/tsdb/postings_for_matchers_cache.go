@@ -3,6 +3,7 @@ package tsdb
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -75,9 +76,11 @@ type PostingsForMatchersCache struct {
 
 func (c *PostingsForMatchersCache) PostingsForMatchers(ctx context.Context, ix IndexPostingsReader, concurrent bool, ms ...*labels.Matcher) (index.Postings, error) {
 	if !concurrent && !c.force {
+		panic("Force should be enabled")
 		return c.postingsForMatchers(ctx, ix, ms...)
 	}
 	c.expire()
+	fmt.Printf("Force is enabled\n")
 	return c.postingsForMatchersPromise(ctx, ix, ms)()
 }
 
@@ -108,7 +111,20 @@ func (c *PostingsForMatchersCache) postingsForMatchersPromise(ctx context.Contex
 	}
 	defer promise.Done()
 
+	found := false
+	for _, m := range ms {
+		if m.String() == `__name__="cortex_ring_members"` {
+			found = true
+			break
+		}
+
+		fmt.Printf("Not a match: %s\n", m.String())
+	}
+	if found {
+		fmt.Printf("Found it!\n")
+	}
 	if postings, err := c.postingsForMatchers(ctx, ix, ms...); err != nil {
+		fmt.Printf("\nIt failed: %s\n\n", err)
 		promise.err = err
 	} else {
 		promise.cloner = index.NewPostingsCloner(postings)
