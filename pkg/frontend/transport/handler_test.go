@@ -200,6 +200,8 @@ func TestHandler_ServeHTTP(t *testing.T) {
 				require.EqualValues(t, "2562047h47m16.854775807s", msg["time_since_param_end"])
 				require.EqualValues(t, "2562047h47m16.854775807s", msg["time_since_param_start"])
 				require.EqualValues(t, "0s", msg["length"])
+				require.EqualValues(t, 0, msg["uncached_results_bytes"])
+				require.EqualValues(t, 0, msg["cached_results_bytes"])
 
 				for name, values := range tt.expectedParams {
 					logMessageKey := fmt.Sprintf("param_%v", name)
