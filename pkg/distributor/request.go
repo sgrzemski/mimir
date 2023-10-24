@@ -71,7 +71,7 @@ func (r *Request) GetHeader(key string) []string {
 			return h.Values
 		}
 	}
-	return nil
+	return []string{}
 }
 
 func (r *Request) Headers() []*httpgrpc.Header {

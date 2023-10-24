@@ -115,8 +115,6 @@ func TestDistributor_Push(t *testing.T) {
 		mtime.NowReset()
 	})
 
-	// expErrFail := httpgrpc.Errorf(http.StatusInternalServerError, "failed pushing to ingester: Fail")
-
 	type samplesIn struct {
 		num              int
 		startTimestampMs int64

@@ -951,12 +951,8 @@ func (d *Distributor) prePushValidationMiddleware(next PushFunc) PushFunc {
 			d.discardedSamplesRateLimited.WithLabelValues(userID, group).Add(float64(validatedSamples))
 			d.discardedExemplarsRateLimited.WithLabelValues(userID).Add(float64(validatedExemplars))
 			d.discardedMetadataRateLimited.WithLabelValues(userID).Add(float64(validatedMetadata))
-			attemps := pushReq.GetHeader("Retry-Attempt")
-			attemp := "1"
-			if !(attemps == nil || len(attemps) == 0) {
-				attemp = attemps[0]
-			}
-			pushReq.AddHeader("Retry-After", []string{strconv.Itoa(d.getRetryAfter(attemp))})
+			d.addRetryAfter(pushReq)
+
 			return newIngestionRateLimitedError(d.limits.IngestionRate(userID), d.limits.IngestionBurstSize(userID))
 		}
 
@@ -1057,7 +1053,7 @@ func (d *Distributor) limitsMiddleware(next PushFunc) PushFunc {
 		now := mtime.Now()
 		if !d.requestRateLimiter.AllowN(now, userID, 1) {
 			d.discardedRequestsRateLimited.WithLabelValues(userID).Add(1)
-			pushReq.AddHeader("Retry-After", []string{strconv.Itoa(d.getRetryAfter())})
+			d.addRetryAfter(pushReq)
 			return newRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID))
 		}
 
@@ -1084,35 +1080,37 @@ func (d *Distributor) limitsMiddleware(next PushFunc) PushFunc {
 	}
 }
 
-func (d *Distributor) getRetryAfter(attemp string) int {
+func (d *Distributor) addRetryAfter(req *Request) {
+	attemps := req.GetHeader("Retry-Attempt")
+	attemp := "1"
+	if len(attemps) > 0 {
+		attemp = attemps[0]
+	}
 	retryAttemp, err := strconv.Atoi(attemp)
-	if err != nil {
+	if attemp == "" || err != nil {
 		retryAttemp = 1
 	}
-	delaySeconds := 1
+	// the default value of average is RetryAfterAverage
+	average := d.cfg.RetryAfterAverage
+
 	switch d.cfg.RetryStrategy {
-	case 1:
-		// Add a random jitter between -1.0*delaySeconds and + 1.0*delaySeconds.
-		jitter := int((rand.Float64()*2.0 - 1.0) * float64(d.cfg.RetryAfterAverage))
-		delaySeconds = jitter + int(d.cfg.RetryAfterAverage)
 	case 2:
-		// Add a random jitter between -1.0*delaySeconds and + 1.0*delaySeconds.
-		jitter := int((rand.Float64()*2.0 - 1.0) * float64(d.cfg.RetryAfterAverage*time.Duration(retryAttemp)))
-		delaySeconds = jitter + int(d.cfg.RetryAfterAverage)*retryAttemp
+		average = d.cfg.RetryAfterAverage * time.Duration(retryAttemp)
 	case 3:
-		
-	default:
-		delaySeconds = int(d.cfg.RetryAfterAverage)
+		average = d.cfg.RetryAfterAverage * time.Duration(math.Pow(2, float64(retryAttemp-1)))
 	}
 
-	// Guarantee that minimum delay is 1 second, maximum delay is 60s.
+	jitter := int((rand.Float64()*2.0-1.0)*float64(average)) + 1
+	delaySeconds := jitter + int(average)
+
+	// Guarantee that min delay is 1 seconds, maximum delay is 60s.
 	if delaySeconds < 1 {
 		delaySeconds = 1
 	} else if delaySeconds > 60 {
 		delaySeconds = 60
 	}
 
-	return delaySeconds
+	req.AddHeader("Retry-After", []string{strconv.Itoa(delaySeconds)})
 }
 
 // Push is gRPC method registered as client.IngesterServer and distributor.DistributorServer.
@@ -1123,7 +1121,9 @@ func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mim
 	})
 
 	pushErr := d.PushWithMiddlewares(ctx, pushReq)
+	// Here I can get total number of push, and total number of failed push, because of access of the error code
 	if pushErr == nil {
+
 		return &mimirpb.WriteResponse{}, nil
 	}
 	handledErr := d.handlePushError(ctx, pushErr, pushReq)
