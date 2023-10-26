@@ -130,5 +130,3 @@ jobs:
           GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
           TAG: ${{ steps.compute_hash.outputs.tag }}
           MAIN_TAG: ${{ steps.prepare.outputs.main_image_tag }}
-
-    #       MAIN_TAG: ${{ steps.prepare.outputs.main_image_tag }}
