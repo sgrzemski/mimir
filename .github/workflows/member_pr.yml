@@ -1,10 +1,9 @@
 ### .github/workflows/member_pr.yml
-### This workflow runs against target branch, which is main, so no pull request would able to modify the logic here
-### unitl the pull request is merged into main
+### This workflow runs against target branch, which is main, so no pull request would able to modify the logic here unitl the pull request is merged into main
 name: Membership check
 on:
     # this needs to be pull_request_target, not pull_request, just put pull_request to test
-    pull_request:
+    pull_request_target:
         types: [opened, synchronize]
         paths:
           - mimir-build-image/Dockerfile 
@@ -13,14 +12,39 @@ jobs:
         runs-on: ubuntu-latest
         steps:
           - name: Check user for team affiliation
-            uses: tspascoal/get-user-teams-membership@v2
             id: teamAffiliation
-            with:
-              GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              username: ${{ github.actor }}
-              team: mimir-maintainers
+            run: |
+                ENCODED_USERNAME=$(printf %s "${{ github.triggering_actor }}" | xxd -p -c 256 | tr -d '\n' | sed 's/\(..\)/%\1/g')
+                # Set the GitHub API URL
+                API_URL="https://api.github.com/orgs/grafana/teams/mimir-maintainers/members/$ENCODED_USERNAME"
+                # Send a GET request to the GitHub API
+                response=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token ${{ secrets.GH_BOT_ACCESS_TOKEN }}" $API_URL)
+                # Check if the response is empty or non-integer
+                if [ -z "$response" ]; then
+                  echo "team_membership=error" >> $GITHUB_OUTPUT
+                else
+                  # Set the result as an environment variable based on the response code
+                  if [ "$response" -eq 204 ]; then
+                    echo "team_membership=true" >> $GITHUB_OUTPUT
+                  elif [ "$response" -eq 404 ]; then
+                    echo "team_membership=false" >> $GITHUB_OUTPUT
+                  else
+                    echo "team_membership=error" >> $GITHUB_OUTPUT
+                  fi
+                fi
+
+          - name: Add Comment to the PR
+            id: notification
+            if: ${{ steps.teamAffiliation.outputs.team_membership != 'true' }}
+            run: | 
+                echo "the current value is?? ${{ steps.teamAffiliation.outputs.team_membership }}"
+                gh pr comment $PR_NUMBER --body "You are changing docker image of mimir-build-image. And you have no right to trigger docker image build, please contact one of mimir-maintainer to review your change before preceed."
+            env:
+                PR_NUMBER: ${{ github.event.pull_request.number }}
+                GITHUB_TOKEN: ${{secrets.GH_BOT_ACCESS_TOKEN}}
+
           - name: Stop workflow if user is no member
-            if: ${{ steps.teamAffiliation.outputs.isTeamMember == false }}
+            if: ${{ steps.teamAffiliation.outputs.team_membership != 'true' }}
             run: |
               echo "You have no rights to trigger this job."
               exit 1
