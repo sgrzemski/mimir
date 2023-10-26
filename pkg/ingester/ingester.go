@@ -782,10 +782,10 @@ func (i *Ingester) StartPushRequest(requestSize int64) error {
 		inflightBytes = i.inflightPushRequestsBytes.Add(requestSize)
 	}
 
-	decreaseInflightInDefer := true
+	finishRequestInDefer := true
 	defer func() {
-		if decreaseInflightInDefer {
-			i.inflightPushRequests.Dec()
+		if finishRequestInDefer {
+			i.FinishPushRequest(requestSize)
 		}
 	}()
 
@@ -809,7 +809,7 @@ func (i *Ingester) StartPushRequest(requestSize int64) error {
 		}
 	}
 
-	decreaseInflightInDefer = false
+	finishRequestInDefer = false
 	return nil
 }
 
