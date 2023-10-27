@@ -14,6 +14,7 @@
 package promql
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -368,6 +369,7 @@ func ensureMonotonic(buckets buckets) bool {
 		case buckets[i].count > max:
 			max = buckets[i].count
 		case buckets[i].count < max:
+			fmt.Println("mono ensured")
 			buckets[i].count = max
 			forced = true
 		}
