@@ -2089,6 +2089,10 @@ rollout_operator:
     capabilities:
       drop: [ALL]
     allowPrivilegeEscalation: false
+  
+  nodeSelector: {}
+
+  tolerations: []
 
 minio:
   enabled: true
